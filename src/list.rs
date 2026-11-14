@@ -1,36 +1,23 @@
-use crate::topology::config::{SinkDescription, SourceDescription, TransformDescription};
+#![allow(missing_docs)]
+use clap::Parser;
 use serde::Serialize;
-use structopt::StructOpt;
+use vector_lib::configurable::component::{
+    EnrichmentTableDescription, SinkDescription, SourceDescription, TransformDescription,
+};
 
-#[derive(StructOpt, Debug)]
-#[structopt(rename_all = "kebab-case")]
+#[derive(Parser, Debug)]
+#[command(rename_all = "kebab-case")]
 pub struct Opts {
     /// Format the list in an encoding scheme.
-    ///
-    /// Options: `text`, `json`
-    #[structopt(long, default_value = "text")]
+    #[arg(long, default_value = "text")]
     format: Format,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(clap::ValueEnum, Debug, Clone, PartialEq)]
 enum Format {
     Text,
     Json,
-}
-
-impl std::str::FromStr for Format {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "text" => Ok(Format::Text),
-            "json" => Ok(Format::Json),
-            s => Err(format!(
-                "{} is not a valid option, expected `text` or `json`",
-                s
-            )),
-        }
-    }
+    Avro,
 }
 
 #[derive(Serialize)]
@@ -38,35 +25,47 @@ pub struct EncodedList {
     sources: Vec<&'static str>,
     transforms: Vec<&'static str>,
     sinks: Vec<&'static str>,
+    enrichment_tables: Vec<&'static str>,
 }
 
+/// # Panics
+/// Panics if the component list cannot be serialized to JSON.
+#[must_use]
 pub fn cmd(opts: &Opts) -> exitcode::ExitCode {
     let sources = SourceDescription::types();
     let transforms = TransformDescription::types();
     let sinks = SinkDescription::types();
+    let enrichment_tables = EnrichmentTableDescription::types();
 
+    #[allow(clippy::print_stdout)]
     match opts.format {
         Format::Text => {
             println!("Sources:");
             for name in sources {
-                println!("- {}", name);
+                println!("- {name}");
             }
 
             println!("\nTransforms:");
             for name in transforms {
-                println!("- {}", name);
+                println!("- {name}");
             }
 
             println!("\nSinks:");
             for name in sinks {
-                println!("- {}", name);
+                println!("- {name}");
+            }
+
+            println!("\nEnrichment tables:");
+            for name in enrichment_tables {
+                println!("- {name}");
             }
         }
-        Format::Json => {
+        Format::Json | Format::Avro => {
             let list = EncodedList {
                 sources,
                 transforms,
                 sinks,
+                enrichment_tables,
             };
             println!("{}", serde_json::to_string(&list).unwrap());
         }

@@ -1,0 +1,146 @@
+use std::time::Duration;
+
+use async_compression::tokio::bufread::{ZstdDecoder, ZstdEncoder};
+use base64::{Engine, prelude::BASE64_STANDARD};
+use bytes::Bytes;
+use serde_json::Value;
+use tokio::{
+    io::{AsyncReadExt, BufReader},
+    time::{Instant, sleep},
+};
+use tracing::{debug, warn};
+use vector::test_util::{compression::is_zstd, trace_init};
+use vector_common::Result;
+use vector_common::decompression::CappedDecoder;
+
+mod series;
+mod sketches;
+
+use super::*;
+
+async fn decompress_payload(payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    if is_zstd(payload) {
+        let mut decompressor = ZstdDecoder::new(payload);
+        let mut decompressed = Vec::new();
+        decompressor.read_to_end(&mut decompressed).await?;
+        debug!(
+            "Zstd decompression successful: {} -> {} bytes",
+            payload.len(),
+            decompressed.len()
+        );
+        return Ok(decompressed);
+    }
+
+    let result = CappedDecoder::zlib(payload).decompress();
+    if let Ok(ref decompressed) = result {
+        debug!(
+            "Zlib decompression successful: {} -> {} bytes",
+            payload.len(),
+            decompressed.len()
+        );
+    }
+    result
+}
+
+async fn unpack_proto_payloads<T>(in_payloads: &FakeIntakeResponseRaw) -> Result<Vec<T>>
+where
+    T: prost::Message + Default,
+{
+    let mut out_payloads = vec![];
+
+    for payload in &in_payloads.payloads {
+        // decode base64
+        let payload = BASE64_STANDARD
+            .decode(&payload.data)
+            .map_err(|e| format!("Invalid base64 data: {e}"))?;
+
+        // Skip empty or near-empty payloads (e.g., health checks like '{}' sent with
+        // X-Requested-With: datadog-agent-diagnose header)
+        if payload.len() < 10 {
+            let content_str = String::from_utf8_lossy(&payload);
+
+            // Try to parse as JSON to show structured content
+            let json_repr = serde_json::from_slice::<Value>(&payload).map_or_else(
+                |_| format!("raw: '{content_str}'"),
+                |v| format!("JSON: {v}"),
+            );
+
+            warn!(
+                "Skipping small payload (likely diagnostic/health check): expected protobuf type {}, got {} bytes, content: {json_repr}, hex: {payload:02x?}",
+                std::any::type_name::<T>(),
+                payload.len()
+            );
+            continue;
+        }
+
+        // Try to decode directly first (handles decompressed data from fakeintake)
+        let decoded = if let Ok(decoded) = T::decode(Bytes::from(payload.clone())) {
+            // Successfully decoded directly - fakeintake returned decompressed data
+            debug!(
+                "Decoded protobuf directly (fakeintake returned decompressed): type {}, size {} bytes",
+                std::any::type_name::<T>(),
+                payload.len()
+            );
+            decoded
+        } else {
+            // Direct decode failed - payload is still compressed, decompress first
+            debug!(
+                "Direct decode failed, attempting decompression: type {}, size {} bytes",
+                std::any::type_name::<T>(),
+                payload.len()
+            );
+            let decompressed = decompress_payload(payload.as_slice()).await.map_err(|e| {
+                format!(
+                    "Failed to decompress payload: {e}. Type {}, length {}, first 4 bytes: {:02x?}",
+                    std::any::type_name::<T>(),
+                    payload.len(),
+                    &payload[..payload.len().min(4)]
+                )
+            })?;
+            T::decode(Bytes::from(decompressed)).map_err(|e| {
+                format!(
+                    "Failed to decode protobuf after decompression: {e} (type {})",
+                    std::any::type_name::<T>()
+                )
+            })?
+        };
+
+        out_payloads.push(decoded);
+    }
+
+    Ok(out_payloads)
+}
+
+#[tokio::test]
+async fn validate() {
+    trace_init();
+
+    // Wait for workload data, not compilation time, to make both pipelines ready.
+    // Leave time to report failures before nextest's two-minute test timeout.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    series::validate(deadline).await;
+
+    sketches::validate(deadline).await;
+}
+
+async fn compress_with_zstd(data: &[u8]) -> Vec<u8> {
+    let reader = BufReader::new(data);
+    let mut encoder = ZstdEncoder::new(reader);
+    let mut compressed_data = Vec::new();
+    encoder
+        .read_to_end(&mut compressed_data)
+        .await
+        .expect("unexpected compression error");
+    compressed_data
+}
+
+#[tokio::test]
+async fn test_decompress_payload_zstd() {
+    let original_data = b"Hello, Zstd!";
+    let compressed_data = compress_with_zstd(original_data).await;
+
+    let decompressed_data = decompress_payload(compressed_data.as_slice())
+        .await
+        .expect("decompression failed");
+    assert_eq!(decompressed_data, original_data);
+}

@@ -1,0 +1,211 @@
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use async_trait::async_trait;
+use vector_lib::{
+    config::{AcknowledgementsConfig, Input},
+    configurable::{component::GenerateConfig, configurable_component},
+    internal_event::Protocol,
+    sink::VectorSink,
+    stream::BatcherSettings,
+};
+
+use super::{request_builder::StatsdRequestBuilder, service::StatsdService, sink::StatsdSink};
+use crate::{
+    config::{SinkConfig, SinkContext, UnixOnly, ValidatedSink},
+    internal_events::SocketMode,
+    sinks::{
+        Healthcheck,
+        util::{
+            BatchConfig, SinkBatchSettings,
+            service::net::{
+                NetworkConnector, TcpConnectorConfig, UdpConnectorConfig, UnixConnectorConfig,
+            },
+        },
+    },
+};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StatsdDefaultBatchSettings;
+
+impl SinkBatchSettings for StatsdDefaultBatchSettings {
+    const MAX_EVENTS: Option<usize> = Some(1000);
+    const MAX_BYTES: Option<usize> = Some(1300);
+    const TIMEOUT_SECS: f64 = 1.0;
+}
+
+/// Configuration for the `statsd` sink.
+#[configurable_component(sink("statsd", "Deliver metric data to a StatsD aggregator."))]
+#[derive(Clone, Debug)]
+pub struct StatsdSinkConfig {
+    /// Sets the default namespace for any metrics sent.
+    ///
+    /// This namespace is only used if a metric has no existing namespace. When a namespace is
+    /// present, it is used as a prefix to the metric name, and separated with a period (`.`).
+    #[serde(alias = "namespace")]
+    #[configurable(metadata(docs::examples = "service"))]
+    pub default_namespace: Option<String>,
+
+    #[serde(flatten)]
+    pub mode: Mode,
+
+    #[serde(default)]
+    pub batch: BatchConfig<StatsdDefaultBatchSettings>,
+
+    #[serde(
+        default,
+        deserialize_with = "crate::serde::bool_or_struct",
+        skip_serializing_if = "crate::serde::is_default"
+    )]
+    pub acknowledgements: AcknowledgementsConfig,
+}
+
+/// Socket mode.
+#[configurable_component]
+#[derive(Clone, Debug)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+#[configurable(metadata(docs::enum_tag_description = "The type of socket to use."))]
+pub enum Mode {
+    /// Send over TCP.
+    Tcp(TcpConnectorConfig),
+
+    /// Send over UDP.
+    Udp(UdpConnectorConfig),
+
+    /// Send over a Unix domain socket (UDS).
+    Unix(UnixOnly<UnixConnectorConfig>),
+}
+
+impl Mode {
+    const fn as_socket_mode(&self) -> SocketMode {
+        match self {
+            Self::Tcp(_) => SocketMode::Tcp,
+            Self::Udp(_) => SocketMode::Udp,
+            Self::Unix(_) => SocketMode::Unix,
+        }
+    }
+
+    fn as_connector(&self) -> crate::Result<NetworkConnector> {
+        match self {
+            Self::Tcp(config) => Ok(config.as_connector()),
+            Self::Udp(config) => Ok(config.as_connector()),
+            Self::Unix(config) => config.as_ref().on_unix(
+                (),
+                #[cfg(unix)]
+                |config, ()| config.as_connector().map_err(Into::into),
+            ),
+        }
+    }
+}
+
+const fn default_address() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8125)
+}
+
+impl GenerateConfig for StatsdSinkConfig {
+    fn generate_config() -> serde_json::Value {
+        let address = default_address();
+
+        serde_json::to_value(Self {
+            default_namespace: None,
+            mode: Mode::Udp(UdpConnectorConfig::from_address(
+                address.ip().to_string(),
+                address.port(),
+            )),
+            batch: BatchConfig::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+        })
+        .unwrap()
+    }
+}
+
+#[async_trait]
+#[typetag::serde(name = "statsd")]
+impl SinkConfig for StatsdSinkConfig {
+    fn input(&self) -> Input {
+        Input::metric()
+    }
+
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &self.acknowledgements
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ValidatedStatsd {
+    batcher_settings: BatcherSettings,
+}
+
+#[async_trait]
+impl ValidatedSink for StatsdSinkConfig {
+    type Validated = ValidatedStatsd;
+
+    fn validate(&self) -> crate::Result<ValidatedStatsd> {
+        let batcher_settings = self.batch.into_batcher_settings()?;
+
+        Ok(ValidatedStatsd { batcher_settings })
+    }
+
+    async fn build(
+        &self,
+        validated: &ValidatedStatsd,
+        _cx: SinkContext,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        let socket_mode = self.mode.as_socket_mode();
+        let request_builder =
+            StatsdRequestBuilder::new(self.default_namespace.clone(), socket_mode);
+        let protocol = Protocol::from(socket_mode.as_str());
+
+        let connector = self.mode.as_connector()?;
+        let service = connector.service();
+        let healthcheck = connector.healthcheck();
+
+        let sink = StatsdSink::new(
+            StatsdService::from_transport(service),
+            validated.batcher_settings,
+            request_builder,
+            protocol,
+        );
+        Ok((VectorSink::from_event_streamsink(sink), healthcheck))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{
+        AcknowledgementsConfig, BatchConfig, Mode, SocketMode, StatsdSinkConfig, UdpConnectorConfig,
+    };
+    use crate::config::ValidatedSink;
+
+    #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<StatsdSinkConfig>();
+    }
+
+    #[test]
+    fn unix_mode_deserializes_on_all_platforms() {
+        let config: StatsdSinkConfig = serde_yaml::from_str(indoc::indoc! {r"
+            mode: unix
+            path: /tmp/vector-statsd.sock
+            unix_mode: Datagram
+        "})
+        .unwrap();
+
+        assert!(matches!(config.mode, Mode::Unix(_)));
+    }
+
+    #[test]
+    fn validate_produces_usable_state() {
+        let config = StatsdSinkConfig {
+            default_namespace: Some("service".to_string()),
+            mode: Mode::Udp(UdpConnectorConfig::from_address(
+                "127.0.0.1".to_string(),
+                8125,
+            )),
+            batch: BatchConfig::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+        };
+
+        config.validate().expect("validation should succeed");
+        assert!(matches!(config.mode.as_socket_mode(), SocketMode::Udp));
+    }
+}

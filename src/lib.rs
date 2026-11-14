@@ -1,37 +1,233 @@
-#![allow(clippy::new_without_default, clippy::needless_pass_by_value)]
+#![recursion_limit = "256"] // for async-stream
+#![deny(unreachable_pub)]
+#![deny(unused_extern_crates)]
+#![deny(unused_allocation)]
+#![deny(unused_assignments)]
+#![deny(unused_comparisons)]
+#![deny(warnings)]
+#![deny(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg), deny(rustdoc::broken_intra_doc_links))]
+#![allow(async_fn_in_trait)]
+#![allow(clippy::approx_constant)]
+#![allow(clippy::float_cmp)]
+#![deny(clippy::clone_on_ref_ptr)]
+#![deny(clippy::trivially_copy_pass_by_ref)]
+#![deny(clippy::disallowed_methods)] // [nursery] mark some functions as verboten
+#![deny(clippy::missing_const_for_fn)] // [nursery] valuable to the optimizer, but may produce false positives
 
+//! The main library to support building Vector.
+
+#[cfg(all(unix, feature = "sinks-socket"))]
+#[macro_use]
+extern crate cfg_if;
+#[macro_use]
+extern crate derivative;
 #[macro_use]
 extern crate tracing;
 #[macro_use]
-extern crate prost_derive;
-#[macro_use]
-extern crate derivative;
+extern crate vector_lib;
 
-#[cfg(feature = "jemallocator")]
+#[cfg(all(target_os = "linux", feature = "antithesis-scenario-disk"))]
+extern crate antithesis_instrumentation as _;
+
+pub use indoc::indoc;
+// re-export codecs for convenience
+pub use vector_lib::codecs;
+
+#[cfg(all(unix, feature = "tikv-jemallocator"))]
 #[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+static ALLOC: self::internal_telemetry::allocations::Allocator<tikv_jemallocator::Jemalloc> =
+    self::internal_telemetry::allocations::get_grouped_tracing_allocator(
+        tikv_jemallocator::Jemalloc,
+    );
 
-pub mod buffers;
+pub mod internal_telemetry;
+
+#[macro_use]
+pub mod config;
+pub mod cli;
+pub mod components;
 pub mod conditions;
 pub mod dns;
-pub mod event;
+#[cfg(feature = "docker")]
+pub mod docker;
+pub mod expiring_hash_map;
 pub mod generate;
+pub mod generate_schema;
+#[macro_use]
+pub mod internal_events;
+#[cfg(feature = "lapin")]
+pub mod amqp;
+#[cfg(feature = "api")]
+pub mod api;
+pub mod app;
+pub mod async_read;
+#[cfg(feature = "aws-core")]
+pub mod aws;
+pub mod common;
+pub mod completion;
+mod convert_config;
+pub mod encoding_transcode;
+pub mod enrichment_tables;
+#[cfg(feature = "gcp")]
+pub mod gcp;
+pub(crate) mod graph;
+pub mod heartbeat;
+pub mod http;
+#[cfg(any(feature = "sources-kafka", feature = "sinks-kafka"))]
+pub mod kafka;
+pub mod kubernetes;
+pub mod line_agg;
 pub mod list;
-pub mod metrics;
-pub mod region;
-pub mod runtime;
+#[cfg(any(feature = "sources-nats", feature = "sinks-nats"))]
+pub mod nats;
+pub mod net;
+#[cfg_attr(
+    any(feature = "api", feature = "sources-vector", feature = "sinks-vector"),
+    expect(
+        unreachable_pub,
+        reason = "tonic-build generates `pub` items and has no option to narrow their visibility"
+    )
+)]
+pub(crate) mod proto;
+pub mod providers;
+pub mod secrets;
+pub mod serde;
+#[cfg(windows)]
+pub mod service;
+pub mod signal;
+pub(crate) mod sink_ext;
 pub mod sinks;
 pub mod sources;
+#[cfg(feature = "api-client")]
+pub mod tap;
 pub mod template;
 pub mod test_util;
+#[cfg(feature = "top")]
+pub mod top;
 pub mod topology;
 pub mod trace;
 pub mod transforms;
 pub mod types;
 pub mod unit_test;
+pub mod validate;
+#[cfg(windows)]
+pub mod vector_windows;
 
-pub use event::Event;
+pub use vector_lib::{
+    Error, Result, event, metrics, schema, shutdown, source_sender::SourceSender, tcp, tls,
+};
 
-pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+static APP_NAME_SLUG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static USE_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-pub type Result<T> = std::result::Result<T, Error>;
+/// The name used to identify this Vector application.
+///
+/// This can be set at compile-time through the `VECTOR_APP_NAME` env variable.
+/// Defaults to "Vector".
+#[must_use]
+pub fn get_app_name() -> &'static str {
+    option_env!("VECTOR_APP_NAME").unwrap_or("Vector")
+}
+
+/// Returns a slugified version of the name used to identify this Vector application.
+///
+/// Defaults to "vector".
+pub fn get_slugified_app_name() -> String {
+    APP_NAME_SLUG
+        .get_or_init(|| get_app_name().to_lowercase().replace(' ', "-"))
+        .clone()
+}
+
+/// Sets the global color preference for diagnostics and CLI output.
+/// This should be called once during application startup.
+pub fn set_global_color(enabled: bool) {
+    if let Err(e) = USE_COLOR.set(enabled) {
+        error!(message = "Failed to set global color.", %e);
+    }
+}
+
+/// Returns true if color output is globally enabled.
+/// Defaults to false if not set.
+pub fn use_color() -> bool {
+    *USE_COLOR.get_or_init(|| false)
+}
+
+/// Formats VRL diagnostics honoring the global color setting.
+pub fn format_vrl_diagnostics(
+    source: &str,
+    diagnostics: impl Into<vrl::diagnostic::DiagnosticList>,
+) -> String {
+    let formatter = vrl::diagnostic::Formatter::new(source, diagnostics);
+    if use_color() {
+        formatter.colored().to_string()
+    } else {
+        formatter.to_string()
+    }
+}
+
+/// The current version of Vector in simplified format.
+/// `<version-number>-nightly`.
+#[must_use]
+pub fn vector_version() -> impl std::fmt::Display {
+    #[cfg(feature = "nightly")]
+    let pkg_version = format!("{}-nightly", built_info::PKG_VERSION);
+
+    #[cfg(not(feature = "nightly"))]
+    let pkg_version = match built_info::DEBUG {
+        // If any debug info is included, consider it a non-release build.
+        "1" | "2" | "true" => {
+            format!(
+                "{}-custom-{}",
+                built_info::PKG_VERSION,
+                built_info::GIT_SHORT_HASH
+            )
+        }
+        _ => built_info::PKG_VERSION.to_string(),
+    };
+
+    pkg_version
+}
+
+/// Returns a string containing full version information of the current build.
+#[must_use]
+pub fn get_version() -> String {
+    let pkg_version = vector_version();
+    let build_desc = built_info::VECTOR_BUILD_DESC;
+    let build_string = match build_desc {
+        Some(desc) => format!("{} {desc}", built_info::TARGET),
+        None => built_info::TARGET.into(),
+    };
+
+    // We do not add 'debug' to the BUILD_DESC unless the caller has flagged on line
+    // or full debug symbols. See the Cargo Book profiling section for value meaning:
+    // https://doc.rust-lang.org/cargo/reference/profiles.html#debug
+    let build_string = match built_info::DEBUG {
+        "1" => format!("{build_string} debug=line"),
+        "2" | "true" => format!("{build_string} debug=full"),
+        _ => build_string,
+    };
+
+    format!("{pkg_version} ({build_string})")
+}
+
+/// Includes information about the current build.
+#[allow(warnings)]
+pub mod built_info {
+    include!(concat!(env!("OUT_DIR"), "/built.rs"));
+}
+
+/// Returns the host name of the current system.
+/// The hostname can be overridden by setting the `VECTOR_HOSTNAME` environment variable.
+///
+/// # Errors
+/// Returns an error if the operating system hostname query fails.
+pub fn get_hostname() -> std::io::Result<String> {
+    Ok(if let Ok(hostname) = std::env::var("VECTOR_HOSTNAME") {
+        hostname
+    } else {
+        hostname::get()?.to_string_lossy().into_owned()
+    })
+}
+
+pub(crate) use vector_lib::spawn_in_current_span;

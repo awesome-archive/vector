@@ -1,0 +1,181 @@
+use std::{
+    collections::BTreeMap,
+    task::{Context, Poll},
+};
+
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use http::{Request, StatusCode, Uri};
+use http_body_util::BodyExt;
+use snafu::ResultExt;
+use tower::Service;
+use vector_http::{HttpError, full_body};
+use vector_lib::{
+    event::{EventFinalizers, EventStatus, Finalizable},
+    request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
+    stream::DriverResponse,
+};
+
+use crate::{
+    http::HttpClient,
+    sinks::{
+        HTTPRequestBuilderSnafu,
+        util::retries::{RetryAction, RetryLogic},
+    },
+};
+
+#[derive(Debug, Default, Clone)]
+pub(super) struct TraceApiRetry;
+
+impl RetryLogic for TraceApiRetry {
+    type Error = HttpError;
+    type Request = TraceApiRequest;
+    type Response = TraceApiResponse;
+
+    fn is_retriable_error(&self, _error: &Self::Error) -> bool {
+        true
+    }
+
+    fn should_retry_response(&self, response: &Self::Response) -> RetryAction<Self::Request> {
+        let status = response.status_code;
+        match status {
+            // Use the same status code/retry policy as the Trace agent, additionally retrying
+            // forbidden requests.
+            //
+            // This retry logic will be expanded further, but specifically retrying unauthorized
+            // requests for now. I verified using `curl` that `403` is the response code for this.
+            //
+            // https://github.com/vectordotdev/vector/issues/10870
+            // https://github.com/vectordotdev/vector/issues/12220
+            StatusCode::FORBIDDEN => RetryAction::Retry("forbidden".into()),
+            StatusCode::REQUEST_TIMEOUT => RetryAction::Retry("request timeout".into()),
+            _ if status.is_server_error() => RetryAction::Retry(
+                format!("{status}: {}", String::from_utf8_lossy(&response.body)).into(),
+            ),
+            _ if status.is_success() => RetryAction::Successful,
+            _ => RetryAction::DontRetry(format!("response status: {status}").into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TraceApiRequest {
+    pub body: Bytes,
+    pub headers: BTreeMap<String, String>,
+    pub finalizers: EventFinalizers,
+    pub uri: Uri,
+    pub uncompressed_size: usize,
+    pub metadata: RequestMetadata,
+}
+
+impl TraceApiRequest {
+    /// Builds a native HTTP request from the encoded trace payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a header name or value is invalid.
+    pub(crate) fn into_http_request(self) -> http::Result<Request<Bytes>> {
+        let mut request = Request::post(self.uri);
+        for (k, v) in &self.headers {
+            request = request.header(k, v);
+        }
+        request.body(self.body)
+    }
+}
+
+impl Finalizable for TraceApiRequest {
+    fn take_finalizers(&mut self) -> EventFinalizers {
+        std::mem::take(&mut self.finalizers)
+    }
+}
+
+impl MetaDescriptive for TraceApiRequest {
+    fn get_metadata(&self) -> &RequestMetadata {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut RequestMetadata {
+        &mut self.metadata
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct TraceApiResponse {
+    status_code: StatusCode,
+    body: Bytes,
+    byte_size: GroupedCountByteSize,
+    uncompressed_size: usize,
+}
+
+impl DriverResponse for TraceApiResponse {
+    fn event_status(&self) -> EventStatus {
+        if self.status_code.is_success() {
+            EventStatus::Delivered
+        } else if self.status_code.is_client_error() {
+            EventStatus::Rejected
+        } else {
+            EventStatus::Errored
+        }
+    }
+
+    fn events_sent(&self) -> &GroupedCountByteSize {
+        &self.byte_size
+    }
+
+    fn bytes_sent(&self) -> Option<usize> {
+        Some(self.uncompressed_size)
+    }
+}
+
+/// Wrapper for the Datadog API.
+///
+/// Provides a `tower::Service` for the Datadog Traces API, allowing it to be
+/// composed within a Tower "stack", such that we can easily and transparently
+/// provide retries, concurrency limits, rate limits, and more.
+#[derive(Debug, Clone)]
+pub(super) struct TraceApiService {
+    client: HttpClient,
+}
+
+impl TraceApiService {
+    pub(super) const fn new(client: HttpClient) -> Self {
+        Self { client }
+    }
+}
+
+impl Service<TraceApiRequest> for TraceApiService {
+    type Response = TraceApiResponse;
+    type Error = HttpError;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    // Emission of Error internal event is handled upstream by the caller
+    fn poll_ready(&mut self, _cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    // Emission of Error internal event is handled upstream by the caller
+    fn call(&mut self, mut request: TraceApiRequest) -> Self::Future {
+        let client = self.client.clone();
+
+        Box::pin(async move {
+            let metadata = std::mem::take(request.metadata_mut());
+            let byte_size = metadata.into_events_estimated_json_encoded_byte_size();
+            let uncompressed_size = request.uncompressed_size;
+            let http_request = request
+                .into_http_request()
+                .context(HTTPRequestBuilderSnafu)
+                .map_err(crate::Error::from)?;
+
+            let response = client.send(http_request.map(full_body)).await?;
+            let (parts, body) = response.into_parts();
+            let body = body.collect().await.map_err(HttpError::new)?.to_bytes();
+
+            Ok(TraceApiResponse {
+                status_code: parts.status,
+                body,
+                byte_size,
+                uncompressed_size,
+            })
+        })
+    }
+}

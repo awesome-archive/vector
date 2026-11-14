@@ -1,0 +1,285 @@
+use bytes::{BufMut, BytesMut};
+use syslog::{Facility, Formatter3164, LogFormat, Severity};
+use vector_lib::configurable::configurable_component;
+use vector_lib::internal_event::emit;
+use vrl::value::Kind;
+
+use crate::{
+    codecs::{Encoder, EncodingConfig, Transformer},
+    config::{
+        AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext,
+        ValidatedSink,
+    },
+    event::Event,
+    internal_events::TemplateRenderingError,
+    schema,
+    sinks::util::{UriSerde, tcp::TcpSinkConfig},
+    tcp::TcpKeepaliveConfig,
+    template::UnconfinedTemplate,
+    tls::TlsEnableableConfig,
+};
+
+/// Configuration for the `papertrail` sink.
+#[configurable_component(sink("papertrail", "Deliver log events to Papertrail from SolarWinds."))]
+#[derive(Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct PapertrailConfig {
+    /// The TCP endpoint to send logs to.
+    #[configurable(metadata(docs::examples = "logs.papertrailapp.com:12345"))]
+    endpoint: UriSerde,
+
+    encoding: EncodingConfig,
+
+    keepalive: Option<TcpKeepaliveConfig>,
+
+    tls: Option<TlsEnableableConfig>,
+
+    /// Configures the send buffer size using the `SO_SNDBUF` option on the socket.
+    send_buffer_bytes: Option<usize>,
+
+    /// The value to use as the `process` in Papertrail.
+    #[configurable(metadata(docs::examples = "{{ process }}", docs::examples = "my-process",))]
+    #[serde(default = "default_process")]
+    process: UnconfinedTemplate,
+
+    #[serde(
+        default,
+        deserialize_with = "crate::serde::bool_or_struct",
+        skip_serializing_if = "crate::serde::is_default"
+    )]
+    acknowledgements: AcknowledgementsConfig,
+}
+
+fn default_process() -> UnconfinedTemplate {
+    UnconfinedTemplate::try_from("vector").unwrap()
+}
+
+impl GenerateConfig for PapertrailConfig {
+    fn generate_config() -> serde_json::Value {
+        serde_yaml::from_str(indoc::indoc! {
+            r#"endpoint: "logs.papertrailapp.com:12345"
+            encoding:
+              codec: json"#,
+        })
+        .unwrap()
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "papertrail")]
+impl SinkConfig for PapertrailConfig {
+    fn input(&self) -> Input {
+        let requirement = schema::Requirement::empty().optional_meaning("host", Kind::bytes());
+
+        Input::new(self.encoding.config().input_type() & DataType::Log)
+            .with_schema_requirement(requirement)
+    }
+
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &self.acknowledgements
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ValidatedPapertrail {
+    address: String,
+    tls: Option<TlsEnableableConfig>,
+    transformer: Transformer,
+}
+
+#[async_trait::async_trait]
+impl ValidatedSink for PapertrailConfig {
+    type Validated = ValidatedPapertrail;
+
+    fn validate(&self) -> crate::Result<ValidatedPapertrail> {
+        let host = self
+            .endpoint
+            .uri
+            .host()
+            .map(str::to_string)
+            .ok_or_else(|| "A host is required for endpoint".to_string())?;
+        let port = self
+            .endpoint
+            .uri
+            .port_u16()
+            .ok_or_else(|| "A port is required for endpoint".to_string())?;
+        self.encoding.validate()?;
+
+        let address = format!("{host}:{port}");
+        let tls = Some(
+            self.tls
+                .clone()
+                .unwrap_or_else(TlsEnableableConfig::enabled),
+        );
+
+        let transformer = self.encoding.transformer();
+
+        Ok(ValidatedPapertrail {
+            address,
+            tls,
+            transformer,
+        })
+    }
+
+    async fn build(
+        &self,
+        validated: &ValidatedPapertrail,
+        _cx: SinkContext,
+    ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
+        let ValidatedPapertrail {
+            address,
+            tls,
+            transformer,
+        } = validated.clone();
+
+        let pid = std::process::id();
+        let process = self.process.clone();
+
+        let sink_config = TcpSinkConfig::new(address, self.keepalive, tls, self.send_buffer_bytes);
+
+        let serializer = self.encoding.build()?;
+        let encoder = Encoder::<()>::new(serializer);
+
+        sink_config.build(
+            Transformer::default(),
+            PapertrailEncoder {
+                pid,
+                process,
+                transformer,
+                encoder,
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PapertrailEncoder {
+    pid: u32,
+    process: UnconfinedTemplate,
+    transformer: Transformer,
+    encoder: Encoder<()>,
+}
+
+impl tokio_util::codec::Encoder<Event> for PapertrailEncoder {
+    type Error = vector_lib::codecs::encoding::Error;
+
+    fn encode(
+        &mut self,
+        mut event: Event,
+        buffer: &mut bytes::BytesMut,
+    ) -> Result<(), Self::Error> {
+        let host = event
+            .as_mut_log()
+            .get_host()
+            .map(|host| host.to_string_lossy().into_owned());
+
+        let process = self
+            .process
+            .render_string(&event)
+            .map_err(|error| {
+                emit(TemplateRenderingError {
+                    error,
+                    field: Some("process"),
+                    drop_event: false,
+                });
+            })
+            .ok()
+            .unwrap_or_else(|| String::from("vector"));
+
+        let formatter = Formatter3164 {
+            facility: Facility::LOG_USER,
+            hostname: host,
+            process,
+            pid: self.pid,
+        };
+
+        self.transformer.transform(&mut event);
+
+        let mut bytes = BytesMut::new();
+        self.encoder.encode(event, &mut bytes)?;
+
+        let message = String::from_utf8_lossy(&bytes);
+
+        formatter
+            .format(&mut buffer.writer(), Severity::LOG_INFO, message)
+            .map_err(|error| Self::Error::SerializingError(format!("{error}").into()))?;
+
+        buffer.put_u8(b'\n');
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+    use futures::{future::ready, stream};
+    use tokio_util::codec::Encoder as _;
+    use vector_lib::{
+        codecs::JsonSerializerConfig,
+        event::{Event, LogEvent},
+    };
+    use vrl::event_path;
+
+    use super::*;
+    use crate::test_util::{
+        components::{SINK_TAGS, run_and_assert_sink_compliance},
+        http::{always_200_response, spawn_blackhole_http_server},
+    };
+
+    #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<PapertrailConfig>();
+    }
+
+    #[test]
+    fn validate_produces_usable_state() {
+        let config: PapertrailConfig = serde_json::from_value(PapertrailConfig::generate_config())
+            .expect("config should be valid");
+        let validated = config.validate().expect("validation should succeed");
+        assert_eq!(validated.address, "logs.papertrailapp.com:12345");
+        assert!(validated.tls.is_some());
+    }
+
+    #[tokio::test]
+    async fn component_spec_compliance() {
+        let mock_endpoint = spawn_blackhole_http_server(always_200_response).await;
+
+        let mut config: PapertrailConfig =
+            serde_json::from_value(PapertrailConfig::generate_config())
+                .expect("config should be valid");
+        config.endpoint = mock_endpoint.try_into().unwrap();
+        config.tls = Some(TlsEnableableConfig::default());
+
+        let context = SinkContext::default();
+        let (sink, _healthcheck) = SinkConfig::build(&config, context).await.unwrap();
+
+        let event = Event::Log(LogEvent::from("simple message"));
+        run_and_assert_sink_compliance(sink, stream::once(ready(event)), &SINK_TAGS).await;
+    }
+
+    #[test]
+    fn encode_event_apply_rules() {
+        let mut evt = Event::Log(LogEvent::from("vector"));
+        evt.as_mut_log().insert(event_path!("magic"), "key");
+        evt.as_mut_log().insert(event_path!("process"), "foo");
+
+        let mut encoder = PapertrailEncoder {
+            pid: 0,
+            process: UnconfinedTemplate::try_from("{{ process }}").unwrap(),
+            transformer: Transformer::new(None, Some(vec!["magic".into()]), None).unwrap(),
+            encoder: Encoder::<()>::new(JsonSerializerConfig::default().build().into()),
+        };
+
+        let mut bytes = BytesMut::new();
+        encoder.encode(evt, &mut bytes).unwrap();
+        let bytes = bytes.freeze();
+
+        let msg = bytes.slice(String::from_utf8_lossy(&bytes).find(": ").unwrap() + 2..bytes.len());
+        let value: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+        let value = value.as_object().unwrap();
+
+        assert!(!value.contains_key("magic"));
+        assert_eq!(value.get("process").unwrap().as_str(), Some("foo"));
+    }
+}

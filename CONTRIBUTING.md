@@ -1,61 +1,112 @@
 # Contributing
 
 First, thank you for contributing to Vector! The goal of this document is to
-clearly provide everything you need to start contributing to Vector. The
-following TOC is sorted in a progressive fashion, starting with the basics and
-expanding into more specifics.
+provide everything you need to start contributing to Vector. The
+following TOC is sorted progressively, starting with the basics and
+expanding into more specifics. Everyone from a first time contributor to a
+Vector team member will find this document useful.
 
-<!-- MarkdownTOC autolink="true" indent="   " -->
-
-- [Assumptions](#assumptions)
+- [Introduction](#introduction)
+- [Your First Contribution](#your-first-contribution)
+  - [New sources, sinks, and transforms](#new-sources-sinks-and-transforms)
 - [Workflow](#workflow)
-   - [Git Branches](#git-branches)
-   - [Git Commits](#git-commits)
-      - [Style](#style)
-      - [Signing](#signing)
-   - [Github Pull Requests](#github-pull-requests)
-      - [Title](#title)
-      - [Merging](#merging)
-   - [CI](#ci)
-- [Development](#development)
-   - [Setup](#setup)
-   - [The Basics](#the-basics)
-      - [Directory Structure](#directory-structure)
-      - [Makefile](#makefile)
-      - [Code Style](#code-style)
-      - [Documentation](#documentation)
-      - [Changelog](#changelog)
-   - [Building a sink](#building-a-sink)
-      - [Healthchecks](#healthchecks)
-         - [Guidelines for writing healthchecks](#guidelines-for-writing-healthchecks)
-   - [Testing](#testing)
-      - [Sample Logs](#sample-logs)
-   - [Benchmarking](#benchmarking)
-- [FAQ](#faq)
-   - [What is conventional commits?](#what-is-conventional-commits)
-   - [Do I need to update the changelog?](#do-i-need-to-update-the-changelog)
-   - [What is a DCO?](#what-is-a-dco)
-   - [Why does Vector adopt the DCO?](#why-does-vector-adopt-the-dco)
-   - [Why a DCO instead of a CLA?](#why-a-dco-instead-of-a-cla)
-   - [What about trivial changes?](#what-about-trivial-changes)
-   - [Granted rights and copyright assignment](#granted-rights-and-copyright-assignment)
-   - [If I’m contributing while an employee, do I still need my employer to sign something?](#if-i%E2%80%99m-contributing-while-an-employee-do-i-still-need-my-employer-to-sign-something)
-   - [What if I forgot to sign my commits?](#what-if-i-forgot-to-sign-my-commits)
+  - [Git Branches](#git-branches)
+  - [Git Commits](#git-commits)
+    - [Style](#style)
+  - [GitHub Pull Requests](#github-pull-requests)
+    - [Reviews & Approvals](#reviews--approvals)
+    - [Merge Style](#merge-style)
+  - [CI](#ci)
+    - [Releasing](#releasing)
+    - [Testing](#testing)
+      - [Skipping tests](#skipping-tests)
+      - [Daily tests](#daily-tests)
+    - [Flakey tests](#flakey-tests)
+      - [Test harness](#test-harness)
+  - [Running Tests Locally](#running-tests-locally)
+  - [Deprecations](#deprecations)
+  - [Dependencies](#dependencies)
+- [Next steps](#next-steps)
+- [Legal](#legal)
+  - [Contributor License Agreement](#contributor-license-agreement)
+  - [Granted rights and copyright assignment](#granted-rights-and-copyright-assignment)
 
-<!-- /MarkdownTOC -->
+## Introduction
 
-## Assumptions
+1. **You're familiar with [GitHub](https://github.com) and the pull request
+   workflow.**
+2. **You've read Vector's [docs](https://vector.dev/docs/).**
+3. **You know about the [Vector community](https://vector.dev/community/).
+   Please use this for help.**
+4. **You've read our [AI Policy](AI_POLICY.md)** if you plan to use AI tools
+   in your contribution.
 
-1. **You are familiar with the [docs](https://vector.dev/docs/).**
-2. **You know about the [Vector community](https://vector.dev/community/),
-   use this for help.**
+## Your First Contribution
+
+1. For large PRs or for breaking changes, ensure your change has an issue! Find an
+   [existing issue][urls.existing_issues] or [open a new issue][urls.new_issue].
+   - This is where you can get a feel if the change will be accepted or not.
+2. Once approved, [fork the Vector repository][urls.fork_repo] in your own
+   GitHub account (only applicable to outside contributors).
+3. [Create a new Git branch][urls.create_branch].
+4. Make your changes.
+5. [Submit the branch as a pull request][urls.submit_pr] to the main Vector
+   repo. A Vector team member should comment and/or review your pull request
+   within a few days. Although, depending on the circumstances, it may take
+   longer.
+
+### New sources, sinks, and transforms
+
+If you're thinking of contributing a new source, sink, or transform to Vector, thank you that's way cool! The answers to
+the below questions are required for each newly proposed component and depending on the answers, we may elect to not
+include the proposed component. If you're having trouble with any of the questions, we're available to help you.
+
+**Prior to beginning work on a new source or sink if a GitHub Issue does not already exist, please open one to discuss
+the introduction of the new integration.** Maintainers will review the proposal with the following checklist in mind,
+try and consider them when sharing your proposal to reduce the amount of time it takes to review your proposal. This
+list is not exhaustive, and may be updated over time.
+
+- [ ] Can the proposed component’s functionality be replicated by an existing component, with a specific configuration?
+(ex: Azure Event Hub as a `kafka` sink configuration)
+  - [ ] Alternatively implemented as a wrapper around an existing component. (ex. `axiom` wrapping `elasticsearch`)
+- [ ] Can an existing component replicate the proposed component’s functionality, with non-breaking changes?
+- [ ] Can an existing component be rewritten in a more generic fashion to cover both the existing and proposed functions?
+- [ ] Is the proposed component generically usable or is it specific to a particular service?
+  - [ ] How established is the target of the integration, what is the relative market share of the integrated service?
+- [ ] Is there sufficient demand for the component?
+  - [ ] If the integration can be served with a workaround or more generic component, how painful is this for users?
+- [ ] Is the contribution from an individual or the organization owning the integrated service? (examples of
+organization backed integrations: `databend` sink, `axiom` sink)
+  - [ ] Is the contributor committed to maintaining the integration if it is accepted?
+- [ ] What is the overall complexity of the proposed design of this integration from a technical and functional
+standpoint, and what is the expected ongoing maintenance burden?
+- [ ] How will this integration be tested and QA’d for any changes and fixes?
+  - [ ] Will we have access to an account with the service if the integration is not open source?
+
+To merge a new source, sink, or transform, the pull request is required to:
+
+- [ ] Add tests, especially integration tests if your contribution connects to an external service.
+- [ ] Add instrumentation so folks using your integration can get insight into how it's working and performing. You can
+see some [example of instrumentation in existing integrations](https://github.com/vectordotdev/vector/tree/master/src/internal_events).
+- [ ] Add documentation. You need to generate and create documentation files for your component. See the [component documentation guide](docs/DOCUMENTING.md#adding-documentation-for-new-components) for detailed instructions.
+
+When adding new integration tests, the following changes are needed in the GitHub Workflows:
+
+- in `.github/workflows/integration.yml`, add another entry in the matrix definition for the new integration.
+- in `.github/workflows/integration-comment.yml`, add another entry in the matrix definition for the new integration.
+- in `.github/workflows/changes.yml`, add a new filter definition for files changed, and update the `changes` job
+outputs to reference the filter, and finally update the outputs of `workflow_call` to include the new filter.
 
 ## Workflow
 
 ### Git Branches
 
-_All_ changes must be made in a branch and submitted as [pull requests](#pull-requests).
-Vector does not adopt any type of branch naming style, but please use something
+_All_ changes must be made in a branch and submitted as [pull requests](#github-pull-requests).
+
+If you want your branch to have a website preview build created, include the word `website` in the
+branch.
+
+Otherwise, Vector does not adopt any type of branch naming style, but please use something
 descriptive of your changes.
 
 ### Git Commits
@@ -66,287 +117,216 @@ Please ensure your commits are small and focused; they should tell a story of
 your change. This helps reviewers to follow your changes, especially for more
 complex changes.
 
-#### Signing
+#### Pre-push
 
-Your commits must include a [DCO](https://developercertificate.org/) signature.
-This is simpler than it sounds; it just means that all of your commits
-must contain:
+To reduce iterations you can create do the following:
 
-```
-Signed-off-by: Joe Smith <joe.smith@email.com>
-```
-
-Git makes this easy by adding the `-s` or `--signoff` flags when you commit:
-
-```bash
-git commit -sm 'My commit message'
+```shell
+touch .git/hooks/pre-push
+chmod +x .git/hooks/pre-push
 ```
 
-We also included a `make signoff` target that handles this for you if
-you forget.
+You can use the following as a starting point:
 
-### Github Pull Requests
+```shell
+#!/bin/sh
+set -e
 
-Once your changes are ready you must submit your branch as a [pull \
-request](https://github.com/timberio/vector/pulls).
+echo "Format code"
 
-#### Title
-
-The pull request title must follow the format outlined in the [conventional \
-commits spec](https://www.conventionalcommits.org) (see the ["What is
-conventional commits?" FAQ](#what-is-conventional-commits)). A list of allowed
-sub categories is defined
-[here](https://github.com/timberio/vector/tree/master/.github).
-
-The follow are all good examples of pull request titles:
-
-```
-feat(new sink): new `xyz` sink
-feat(tcp source): add foo bar baz feature
-fix(tcp source): fix foo bar baz bug
-chore: improve build process
-docs: fix typos
-```
-
-#### Merging
-
-At least one Vector team member must approve your work before merging. All
-pull requests are squashed and merged.
-
-### CI
-
-Currently Vector uses [CircleCI](https://circleci.com). The build process
-is defined in `/.circleci/config.yml`. This delegates heavily to the
-[`distribution/docker`](/distribution/docker) folder where Docker images are
-defined for all of our testing, building, verifying, and releasing.
-
-Tests are run for all changes, and Circleci is reponsible for releasing
-updated versions of Vector through various channels.
-
-## Development
-
-### Setup
-
-1. Install Rust via [`rustup`](https://rustup.rs/):
-
-   ```bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   ```
-
-2. [Install Docker](https://docs.docker.com/install/). Docker
-   containers are used for mocking Vector's integrations.
-
-3. [Install Ruby](https://www.ruby-lang.org/en/downloads/) and
-   [Bundler 2](https://bundler.io/v2.0/guides/bundler_2_upgrade.html).
-   They are used to build Vector's documentation.
-
-### The Basics
-
-#### Directory Structure
-
-* [`/benches`](/benches) - Internal benchmarks.
-* [`/config`](/config) - Public facing Vector config, included in releases.
-* [`/distribution`](/distribution) - Distribution artifacts for various targets.
-* [`/docs`](/docs) - https://vector.dev/docs/ source.
-* [`/lib`](/lib) - External libraries that do not depend on `vector` but are used within the project.
-* [`/proto`](/proto) - Protobuf definitions.
-* [`/scripts`](/scripts) - Scripts used to generate docs and maintain the repo.
-* [`/tests`](/tests) - Various high-level test cases.
-
-#### Makefile
-
-Vector includes a [`Makefile`](/Makefile) in the root of the repo. This serves
-as a high-level interface for common commands. Running `make` will produce
-a list of make targets with descriptions. These targets will be referenced
-throughout this document.
-
-#### Code Style
-
-We use `rustfmt` on `stable` to format our code and CI will verify that your
-code follows
-this format style. To run the following command make sure `rustfmt` has been
-installed on the stable toolchain locally.
-
-```bash
-# To install rustfmt
-rustup component add rustfmt
-
-# To format the code
 make fmt
+
+echo "Running pre-push checks..."
+
+# We recommend always running all the following checks.
+make check-licenses
+make check-fmt
+make check-clippy
+make check-generated-docs
+
+# Lint GitHub Actions workflows.
+make check-actionlint
+
+# Some other checks that in our experience rarely fail on PRs.
+make check-deny
+make check-docs
+make check-examples
+make check-scripts
+make check-changelog-fragments
+
+# Spell-check the codebase (fast, requires typos-cli: cargo install typos-cli)
+typos
+
+# The following check is very slow.
+# make check-component-features
 ```
 
-#### Documentation
+Please note that `make check-all` covers all checks, but it is slow and may runs checks not
+relevant to your PR. This command is defined in the
+[Makefile](https://github.com/vectordotdev/vector/blob/1ef01aeeef592c21d32ba4d663e199f0608f615b/Makefile#L450-L454).
 
-Documentation is extremely important to the Vector project. Ideally, all
-contributions that will change or add behavior to Vector should include the
-relevant updates to the documentation website.
+### GitHub Pull Requests
 
-The project attempts to make documentation updates as easy as possible, reducing
-most of it down to a few small changes which are outlined in
-[DOCUMENTING.md](/DOCUMENTING.md).
+Please see [Community response expectations](COMMUNITY_RESPONSE_EXPECTATIONS.md)
+for information about how maintainers prioritize pull requests, issues, and
+discussions.
 
-Regardless of whether your changes require documentation updates you should
-always run `make generate` before attempting to merge your commits.
+Once your changes are ready you must submit your branch as a [pull request](https://github.com/vectordotdev/vector/pulls).
+
+#### Reviews & Approvals
+
+All pull requests should be reviewed by:
+
+- No review required for cosmetic changes like whitespace, typos, and spelling
+  by a maintainer
+- One Vector team member for minor changes or trivial changes from contributors
+- Two Vector team members for major changes
+- Three Vector team members for RFCs
+
+If CODEOWNERS are assigned, a review from an individual from each of the sets of owners is required.
+
+#### Merge Style
+
+All pull requests are squashed and merged. We generally discourage large pull
+requests that are over 300-500 lines of diff. If you would like to propose a
+change that is larger we suggest coming onto our [Discord server](https://chat.vector.dev/) and discuss it
+with one of our engineers. This way we can talk through the solution and
+discuss if a change that large is even needed! This will produce a quicker
+response to the change and likely produce code that aligns better with our
+process.
 
 #### Changelog
 
-Developers do not need to maintain the [`Changelog`](/CHANGELOG.md). This is
-automatically generated via the `make release` command. This is made possible
-by the use of [conventional commit](#what-is-conventioonal-commits) titles.
+By default, all pull requests are assumed to include user-facing changes that
+need to be communicated in the project's changelog. If your pull request does
+not contain user-facing changes that warrant describing in the changelog, add
+the label 'no-changelog' to your PR. When in doubt, consult the vector team
+for guidance. The details on how to add a changelog entry for your PR are
+outlined in detail in [changelog.d/README.md](changelog.d/README.md).
 
-### Building a sink
+For a new deprecation announcement, follow the [deprecation policy](docs/DEPRECATION_POLICY.md)
+and add a notice to `deprecation.d/` instead.
 
-#### Healthchecks
+### CI
 
-Sinks may implement a healthcheck as a means for validating their configuration
-against the envionment and external systems. Ideally, this allows the system to
-inform users of problems such as insufficient credentials, unreachable
-endpoints, non-existant tables, etc. They're not perfect, however, since it's
-impossible to exhaustively check for issues that may happen at runtime.
+Currently, Vector uses GitHub Actions to run tests. The workflows are defined in
+`.github/workflows`.
 
-##### Guidelines for writing healthchecks
+#### Releasing
 
-When implementing healthchecks, we prefer false positives to false negatives.
-This means we would prefer that a healthcheck pass and the sink then fail than
-to have the healthcheck fail when the sink would have been able to run
-successfully.
+GitHub Actions is responsible for releasing updated versions of Vector through
+various channels.
 
-A common cause of false negatives in healthchecks is performing an operation
-that the sink itself does not need. For example, listing all of the available S3
-buckets and checking that the configured bucket is in that list. The S3 sink
-doesn't need the ability to list all buckets, and a user that knows that may not
-have given it permission to do so. In that case, the healthcheck will fail due
-to bad credentials even through its credentials are sufficient for normal
-operation.
+#### Testing
 
-This leads to a general strategy of mimicking what the sink itself does.
-Unfortunately, the fact that healthchecks don't have real events available to
-them leads to some limitations here. The most obvious example of this is with
-sinks where the exact target of a write depends on the value of some field in
-the event (e.g. an interpolated Kinesis stream name). It also pops up for sinks
-where incoming events are expected to conform to a specific schema. In both
-cases, random test data is reasonably likely to trigger a potentially false
-negative result. Even in simpler cases, we need to think about the effects of
-writing test data and whether the user would find that surprising or invasive.
-The answer usually depends on the system we're interfacing with.
+##### Daily tests
 
-In some cases, like the Kinesis example above, the right thing to do might be
-nothing at all. If we require dynamic information to figure out what entity
-(i.e. Kinesis stream in this case) that we're even dealing with, odds are very
-low that we'll be able to come up with a way to meaningfully validate that it's
-in working order. It's perfectly valid to have a healthcheck that falls back to
-doing nothing when there is a data dependency like this.
+Some long-running tests are only run daily, rather than on every pull request.
+If needed, an administrator can kick off these tests manually via the button on
+the [nightly build action
+page](https://github.com/vectordotdev/vector/actions?query=workflow%3Anightly)
 
-With all that in mind, here is a simple checklist to go over when writing a new
-healthcheck:
+#### Flakey tests
 
-- [ ] Does this check perform different fallible operations from the sink itself?
-- [ ] Does this check have side effects the user would consider undesirable (e.g. data pollution)?
-- [ ] Are there situations where this check would fail but the sink would operate normally?
+Historically, we've had some trouble with tests being flakey. If your PR does
+not have passing tests:
 
-Not all of the answers need to be a hard "no", but we should think about the
-likelihood that any "yes" would lead to false negatives and balance that against
-the usefulness of the check as a whole for finding problems. Because we have the
-option to disable individual healthchecks, there's an escape hatch for users
-that fall into a false negative circumstance. Our goal should be to minimize the
-likelihood of users needing to pull that lever while still making a good effort
-to detect common problems.
+- Ensure that the test failures are unrelated to your change
+  - Is it failing on master?
+  - Does it fail if you rerun CI?
+  - Can you reproduce locally?
+- Find or open an issue for the test failure
+  ([example](https://github.com/vectordotdev/vector/issues/3781))
+- Link the PR in the issue for the failing test so that there are more examples
 
-### Testing
+##### Test harness
 
-You can run Vector's tests via the `make test` command. Our tests use Docker
-compose to spin up mock services for testing, such as
-[localstack](https://github.com/localstack/localstack).
-
-#### Sample Logs
-
-We use `flog` to build a sample set of log files to test sending logs from a
-file. This can be done with the following commands on mac with homebrew.
-Installation instruction for flog can be found
-[here](https://github.com/mingrammer/flog#installation).
+You can invoke the [test harness][urls.vector_test_harness] by commenting on
+any pull request with:
 
 ```bash
-flog --bytes $((100 * 1024 * 1024)) > sample.log
+/test -t <name>
 ```
 
-This will create a `100MiB` sample log file in the `sample.log` file.
+### Running Tests Locally
 
-### Benchmarking
+To run tests locally, use [cargo vdev](https://github.com/vectordotdev/vector/blob/master/vdev/README.md).
 
-All benchmarks are placed in the [`/benchmarks`](/benchmarks) folder. Yuo can
-run benchmarks via the `make benchmarks` command.
+Unit tests can be run by calling `cargo vdev test`.
 
-## FAQ
+Integration tests are not run by default when running
+`cargo vdev test`. Instead, they are accessible via the integration subcommand (example:
+`cargo vdev int test aws` runs aws-related integration tests). You can find the list of available integration tests using `cargo vdev int show`. Integration tests require docker or podman to run.
 
-### What is conventional commits?
+### Running other checks
 
-[Conventional commits](https://www.conventionalcommits.org) is a standardized
-format for commit messages. Vector only requires this format for commits on
-the `master` branch. And because Vector squashes commits before merging
-branches, this means that only the pull request title must conform to this
-format. Vector performs a pull request check to verify the pull request title
-in case you forget.
+There are other checks that are run by CI before the PR can be merged. These should be run locally
+first to ensure they pass.
 
-### Do I need to update the changelog?
+```sh
+# Run the Clippy linter to catch common mistakes.
+cargo vdev check rust --fix
+# Ensure all code is properly formatted. Code can be run through `rustfmt` using `cargo fmt` to ensure it is properly formatted.
+cargo vdev check fmt
+# Ensure the internal metrics that Vector emits conform to standards.
+cargo vdev check events
+# Ensure the `LICENSE-3rdparty.csv` file is up to date with the licenses each of Vector's dependencies are published under.
+cargo vdev check licenses
+# Vector's documentation for each component is generated from the comments attached to the Component structs and members.
+# Running this ensures that the generated docs are up to date.
+make check-generated-docs
+```
 
-Nope! This is one of the primary reasons we use the conventional commits style.
-Before releasing Vector we'll automatically generate a changelog for the
-release.
+### Updating licences
 
-### What is a DCO?
+```sh
+cargo install dd-rust-license-tool --locked
+make build-licenses
+git commit -am "updated LICENSE-3rdparty.csv"
+git push
+```
 
-DCO stands for Developer Certificate of Origin and is maintained by the
-[Linux Foundation](https://www.linuxfoundation.org). It is an attestation
-attached to every commit made by every developer. It ensures that all committed
-code adheres to the [Vector license](LICENSE.md) (Apache 2.0).
+### Deprecations
 
-### Why does Vector adopt the DCO?
+When deprecating functionality in Vector, see [DEPRECATION_POLICY.md](docs/DEPRECATION_POLICY.md).
 
-To protect the users of Vector. It ensures that all Vector contributors, and
-committed code, agree to the [Vector license](LICENSE.md).
+### Dependencies
 
-### Why a DCO instead of a CLA?
+When adding, modifying, or removing a dependency in Vector you may find that you need to update the
+inventory of third-party licenses maintained in `LICENSE-3rdparty.csv`. This file is generated using
+[dd-rust-license-tool](https://github.com/DataDog/rust-license-tool.git) and can be updated using
+`make build-licenses`.
 
-It's simpler, clearer, and still protects users of Vector. We believe the DCO
-more accurately embodies the principles of open-source. More info can be found
-here:
+## Next steps
 
-* [Gitlab's switch to DCO](https://about.gitlab.com/2017/11/01/gitlab-switches-to-dco-license/)
-* [DCO vs CLA](https://opensource.com/article/18/3/cla-vs-dco-whats-difference)
+As discussed in the [`README`](README.md), you should continue to the following
+documents:
 
-### What about trivial changes?
+1. **[DEVELOPING.md](docs/DEVELOPING.md)** - Everything necessary to develop
+2. **[DOCUMENTING.md](docs/DOCUMENTING.md)** - Preparing your change for Vector users
+3. **[DEPRECATION_POLICY.md](docs/DEPRECATION_POLICY.md)** - Deprecating functionality in Vector
 
-Trivial changes, such as spelling fixes, do not need to be signed.
+## Legal
+
+To protect all users of Vector, the following legal requirements are made.
+If you have additional questions, please [contact us].
+
+### Contributor License Agreement
+
+Vector requires all contributors to sign the Contributor License Agreement
+(CLA). This gives Vector the right to use your contribution as well as ensuring
+that you own your contributions and can use them for other purposes.
+
+The [full text of the CLA](https://gist.github.com/bits-bot/55bdc97a4fdad52d97feb4d6c3d1d618) is available on GitHub.
 
 ### Granted rights and copyright assignment
 
-It is important to note that the DCO is not a license. The license of the
-project – in our case the Apache License – is the license under which the
-contribution is made. However, the DCO in conjunction with the Apache License
-may be considered an alternate CLA.
+This is covered by the CLA.
 
-The existence of section 5 of the Apache License is proof that the Apache
-License is intended to be usable without CLAs. Users need for the code to be
-open source, with all the legal rights that implies, but it is the open source
-license that provides this. The Apache License provides very generous
-copyright permissions from contributors, and contributors explicitly grant
-patent licenses as well. These rights are granted to everyone.
-
-### If I’m contributing while an employee, do I still need my employer to sign something?
-
-Nope! The DCO confirms that you are entitled to submit the code, which assumes
-that you are authorized to do so.  It treats you like an adult and relies on
-your accurate statement about your rights to submit a contribution.
-
-### What if I forgot to sign my commits?
-
-No probs! We made this simple with the [`signoff` Makefile target](Makefile):
-
-```bash
-make signoff
-```
-
-If you prefer to do this manually:
-
-https://stackoverflow.com/questions/13043357/git-sign-off-previous-commits
-
+[contact us]: https://vector.dev/community
+[urls.create_branch]: https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/creating-and-deleting-branches-within-your-repository
+[urls.existing_issues]: https://github.com/vectordotdev/vector/issues
+[urls.fork_repo]: https://help.github.com/en/github/getting-started-with-github/fork-a-repo
+[urls.new_issue]: https://github.com/vectordotdev/vector/issues/new
+[urls.submit_pr]: https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/creating-a-pull-request-from-a-fork
+[urls.vector_test_harness]: https://github.com/vectordotdev/vector-test-harness/

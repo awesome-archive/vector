@@ -1,84 +1,98 @@
-use criterion::{criterion_group, Criterion};
-use serde_json::{json, Value};
-use vector::{
-    event::{self, Event, LogEvent},
-    transforms::{
-        json_parser::{JsonParser, JsonParserConfig},
-        Transform,
-    },
-};
+use bytes::Bytes;
+use criterion::{BatchSize, Criterion, criterion_group};
+use vector::event::LogEvent;
+use vrl::event_path;
 
-fn benchmark_event(c: &mut Criterion) {
-    c.bench_function("unflatten baseline", |b| {
-        b.iter_with_setup(
+fn benchmark_event_iterate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("event/iterate");
+
+    group.bench_function("single-level", |b| {
+        b.iter_batched_ref(
             || {
-                let mut e = Event::new_empty_log().into_log();
-                e.insert_implicit("key1", "value1");
-                e.insert_implicit("key2", "value2");
-                e.insert_implicit("key3", "value3");
-
-                e
+                let mut log = LogEvent::default();
+                log.insert(event_path!("key1"), Bytes::from("value1"));
+                log.insert(event_path!("key2"), Bytes::from("value2"));
+                log.insert(event_path!("key3"), Bytes::from("value3"));
+                log
             },
-            |e| e.unflatten(),
-        )
+            |e| e.all_event_fields().unwrap().count(),
+            BatchSize::SmallInput,
+        );
     });
 
-    c.bench_function("unflatten single-level", |b| {
-        b.iter_with_setup(
+    group.bench_function("nested-keys", |b| {
+        b.iter_batched_ref(
             || {
-                create_event(json!({
-                    "key1": "value1",
-                    "key2": "value2",
-                    "key3": "value3"
-                }))
+                let mut log = LogEvent::default();
+                log.insert(
+                    event_path!("key1", "nested1", "nested2"),
+                    Bytes::from("value1"),
+                );
+                log.insert(
+                    event_path!("key1", "nested1", "nested3"),
+                    Bytes::from("value4"),
+                );
+                log.insert(event_path!("key3"), Bytes::from("value3"));
+                log
             },
-            |e| e.unflatten(),
-        )
+            |e| e.all_event_fields().unwrap().count(),
+            BatchSize::SmallInput,
+        );
     });
 
-    c.bench_function("unflatten nested-keys", |b| {
-        b.iter_with_setup(
+    group.bench_function("array", |b| {
+        b.iter_batched_ref(
             || {
-                create_event(json!({
-                    "key1": {
-                        "nested1": {
-                            "nested2": "value1",
-                            "nested3": "value4"
-                        }
-                    },
-                    "key3": "value3"
-                }))
+                let mut log = LogEvent::default();
+                log.insert(event_path!("key1", "nested1", 0), Bytes::from("value1"));
+                log.insert(event_path!("key1", "nested1", 1), Bytes::from("value2"));
+                log
             },
-            |e| e.unflatten(),
-        )
-    });
-
-    c.bench_function("unflatten array", |b| {
-        b.iter_with_setup(
-            || {
-                create_event(json!({
-                    "key1": {
-                        "nested1": [
-                            "value1",
-                            "value2"
-                        ]
-                    },
-                }))
-            },
-            |e| e.unflatten(),
-        )
+            |e| e.all_event_fields().unwrap().count(),
+            BatchSize::SmallInput,
+        );
     });
 }
 
-fn create_event(json: Value) -> LogEvent {
-    let s = serde_json::to_string(&json).unwrap();
-    let mut event = Event::new_empty_log();
-    event
-        .as_mut_log()
-        .insert_implicit(event::MESSAGE.clone(), s);
+fn benchmark_event_create(c: &mut Criterion) {
+    let mut group = c.benchmark_group("event/create");
 
-    let mut parser = JsonParser::from(JsonParserConfig::default());
-    parser.transform(event).unwrap().into_log()
+    group.bench_function("single-level", |b| {
+        b.iter(|| {
+            let mut log = LogEvent::default();
+            log.insert(event_path!("key1"), Bytes::from("value1"));
+            log.insert(event_path!("key2"), Bytes::from("value2"));
+            log.insert(event_path!("key3"), Bytes::from("value3"));
+        });
+    });
+
+    group.bench_function("nested-keys", |b| {
+        b.iter(|| {
+            let mut log = LogEvent::default();
+            log.insert(
+                event_path!("key1", "nested1", "nested2"),
+                Bytes::from("value1"),
+            );
+            log.insert(
+                event_path!("key1", "nested1", "nested3"),
+                Bytes::from("value4"),
+            );
+            log.insert(event_path!("key3"), Bytes::from("value3"));
+        });
+    });
+    group.bench_function("array", |b| {
+        b.iter(|| {
+            let mut log = LogEvent::default();
+            log.insert(event_path!("key1", "nested1", 0), Bytes::from("value1"));
+            log.insert(event_path!("key1", "nested1", 1), Bytes::from("value2"));
+        });
+    });
 }
 
-criterion_group!(event, benchmark_event);
+criterion_group!(
+    name = benches;
+    // encapsulates inherent CI noise we saw in
+    // https://github.com/vectordotdev/vector/issues/5394
+    config = Criterion::default().noise_threshold(0.05);
+    targets = benchmark_event_create, benchmark_event_iterate
+);

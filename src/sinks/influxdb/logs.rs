@@ -1,0 +1,1718 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fmt, io, mem,
+    time::Duration,
+};
+
+use bytes::{Bytes, BytesMut};
+use futures::{StreamExt, future, stream::BoxStream};
+use http::Uri;
+use indoc::indoc;
+use tower::{Service, ServiceBuilder};
+use vector_lib::{
+    ByteSizeOf, EstimatedJsonEncodedSizeOf,
+    config::log_schema,
+    configurable::configurable_component,
+    finalization::{EventFinalizers, EventStatus},
+    internal_event::CountByteSize,
+    internal_event::emit,
+    json_size::JsonSize,
+    lookup::{PathPrefix, lookup_v2::OptionalValuePath},
+    request_metadata::{GroupedCountByteSize, RequestMetadata},
+    schema,
+    sensitive_string::SensitiveString,
+    sink::StreamSink,
+    stream::{BatcherSettings, DriverResponse, batcher::BatchConfig as StreamBatchConfig},
+};
+use vrl::{event_path, path::OwnedValuePath, value::Kind};
+
+use super::{
+    Field, InfluxDbSettings, InfluxDbWriteRequest, ProtocolVersion, encode_timestamp, healthcheck,
+    influx_line_protocol, influxdb_settings,
+};
+use crate::{
+    codecs::Transformer,
+    config::{
+        AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext, ValidatedSink,
+    },
+    event::{Event, KeyString, MetricTags, Value},
+    http::HttpClient,
+    internal_events::{InfluxdbEncodingError, LargeEventDroppedError, SinkRequestBuildError},
+    sinks::{
+        Healthcheck, VectorSink,
+        util::{
+            BatchConfig, Compression, HttpEndpoint, RequestBuilder, SinkBatchSettings,
+            TowerRequestConfig,
+            builder::SinkBuilderExt,
+            encoding::{Encoder as SinkEncoder, write_all},
+            http::{
+                HttpRequest, HttpService, HttpServiceRequestBuilder, RetryStrategy,
+                http_response_retry_logic,
+            },
+            metadata::RequestMetadataBuilder,
+            request_builder::{EncodeResult, default_request_builder_concurrency_limit},
+            service::ServiceBuilderExt,
+        },
+    },
+    tls::{TlsConfig, TlsSettings},
+};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InfluxDbLogsDefaultBatchSettings;
+
+impl SinkBatchSettings for InfluxDbLogsDefaultBatchSettings {
+    const MAX_EVENTS: Option<usize> = None;
+    const MAX_BYTES: Option<usize> = Some(1_000_000);
+    const TIMEOUT_SECS: f64 = 1.0;
+}
+
+/// Configuration for the `influxdb_logs` sink.
+#[configurable_component(sink("influxdb_logs", "Deliver log event data to InfluxDB."))]
+#[derive(Clone, Debug)]
+pub struct InfluxDbLogsConfig {
+    /// The name of the InfluxDB measurement that is written to.
+    #[configurable(metadata(docs::examples = "vector-logs"))]
+    #[configurable(metadata(docs::required = true))]
+    pub measurement: Option<String>,
+
+    /// The endpoint to send data to.
+    ///
+    /// This should be a full HTTP URI, including the scheme, host, and port.
+    #[configurable(metadata(docs::examples = "http://localhost:8086"))]
+    pub endpoint: HttpEndpoint,
+
+    /// The list of names of log fields that should be added as tags to each measurement.
+    ///
+    /// By default Vector adds `metric_type` as well as the configured `log_schema.host_key` and
+    /// `log_schema.source_type_key` options.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "field1"))]
+    #[configurable(metadata(docs::examples = "parent.child_field"))]
+    pub tags: Vec<KeyString>,
+
+    #[serde(flatten)]
+    pub settings: InfluxDbSettings,
+
+    #[serde(skip_serializing_if = "crate::serde::is_default", default)]
+    pub encoding: Transformer,
+
+    #[serde(default)]
+    pub batch: BatchConfig<InfluxDbLogsDefaultBatchSettings>,
+
+    #[serde(default)]
+    pub request: TowerRequestConfig,
+
+    pub tls: Option<TlsConfig>,
+
+    #[serde(
+        default,
+        deserialize_with = "crate::serde::bool_or_struct",
+        skip_serializing_if = "crate::serde::is_default"
+    )]
+    acknowledgements: AcknowledgementsConfig,
+
+    // `host_key`, `message_key`, and `source_type_key` are `Option` as we want `vector generate`
+    // to produce a config with these as `None`, to not accidentally override a users configured
+    // `log_schema`. Generating is constrained by build-time and can't account for changes to the
+    // default `log_schema`.
+    /// Use this option to customize the key containing the hostname.
+    ///
+    /// The setting of `log_schema.host_key`, usually `host`, is used here by default.
+    #[configurable(metadata(docs::examples = "hostname"))]
+    pub host_key: Option<OptionalValuePath>,
+
+    /// Use this option to customize the key containing the message.
+    ///
+    /// The setting of `log_schema.message_key`, usually `message`, is used here by default.
+    #[configurable(metadata(docs::examples = "text"))]
+    pub message_key: Option<OptionalValuePath>,
+
+    /// Use this option to customize the key containing the `source_type`.
+    ///
+    /// The setting of `log_schema.source_type_key`, usually `source_type`, is used here by default.
+    #[configurable(metadata(docs::examples = "source"))]
+    pub source_type_key: Option<OptionalValuePath>,
+}
+
+impl GenerateConfig for InfluxDbLogsConfig {
+    fn generate_config() -> serde_json::Value {
+        serde_yaml::from_str(indoc! {r#"
+            endpoint: http://localhost:8086/
+            measurement: vector-logs
+            tags: []
+            version: "2"
+            org: my-org
+            bucket: my-bucket
+            token: ${INFLUXDB_TOKEN}
+        "#})
+        .unwrap()
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "influxdb_logs")]
+impl SinkConfig for InfluxDbLogsConfig {
+    fn input(&self) -> Input {
+        let requirements = schema::Requirement::empty()
+            .optional_meaning("message", Kind::bytes())
+            .optional_meaning("host", Kind::bytes())
+            .optional_meaning("timestamp", Kind::timestamp());
+
+        Input::log().with_schema_requirement(requirements)
+    }
+
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &self.acknowledgements
+    }
+}
+
+#[derive(Clone, derive_more::Debug)]
+pub struct ValidatedInfluxDbLogs {
+    measurement: String,
+    tags: HashSet<KeyString>,
+    batch: BatcherSettings,
+    // Omitted: the retained `uri` embeds the v1 password in its `p` query parameter.
+    #[debug(skip)]
+    uri: Uri,
+    token: SensitiveString,
+    protocol_version: ProtocolVersion,
+    host_key: Option<OwnedValuePath>,
+    message_key: Option<OwnedValuePath>,
+    source_type_key: Option<OwnedValuePath>,
+}
+
+#[async_trait::async_trait]
+impl ValidatedSink for InfluxDbLogsConfig {
+    type Validated = ValidatedInfluxDbLogs;
+
+    fn validate(&self) -> crate::Result<ValidatedInfluxDbLogs> {
+        let measurement = self.get_measurement()?;
+        let tags: HashSet<KeyString> = self.tags.iter().cloned().collect();
+
+        let batch = self.batch.into_batcher_settings()?;
+
+        let settings = influxdb_settings(self.settings.clone());
+
+        let uri = settings.write_uri(self.endpoint.clone())?;
+
+        let token = settings.token();
+        let protocol_version = settings.protocol_version();
+
+        // Only the config-provided keys are retained here; the `log_schema()`
+        // fallbacks are resolved in `build`, after the global log schema has
+        // been initialized. Resolving them here would capture the built-in
+        // defaults, since validation runs before `init_log_schema` at startup.
+        let host_key = self.host_key.as_ref().and_then(|k| k.path.clone());
+        let message_key = self.message_key.as_ref().and_then(|k| k.path.clone());
+        let source_type_key = self.source_type_key.as_ref().and_then(|k| k.path.clone());
+
+        Ok(ValidatedInfluxDbLogs {
+            measurement,
+            tags,
+            batch,
+            uri,
+            token,
+            protocol_version,
+            host_key,
+            message_key,
+            source_type_key,
+        })
+    }
+
+    async fn build(
+        &self,
+        validated: &ValidatedInfluxDbLogs,
+        cx: SinkContext,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedInfluxDbLogs {
+            measurement,
+            tags,
+            batch,
+            uri,
+            token,
+            protocol_version,
+            host_key,
+            message_key,
+            source_type_key,
+        } = validated;
+
+        let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
+        let client = HttpClient::new(tls_settings.into(), cx.proxy())?;
+        let healthcheck = self.healthcheck(client.clone())?;
+
+        let request = self.request.into_settings();
+
+        // Resolve the `log_schema()` fallbacks here, after the global log schema
+        // has been initialized, so custom global log schema keys are honored.
+        let host_key = host_key
+            .clone()
+            .or_else(|| log_schema().host_key().cloned())
+            .expect("global log_schema.host_key to be valid path");
+        let message_key = message_key
+            .clone()
+            .or_else(|| log_schema().message_key().cloned())
+            .expect("global log_schema.message_key to be valid path");
+        let source_type_key = source_type_key
+            .clone()
+            .or_else(|| log_schema().source_type_key().cloned())
+            .expect("global log_schema.source_type_key to be valid path");
+
+        let encoder = InfluxDbLogsEncoder {
+            protocol_version: *protocol_version,
+            measurement: measurement.clone(),
+            tags: tags.clone(),
+            transformer: self.encoding.clone(),
+            host_key,
+            message_key,
+            source_type_key,
+        };
+
+        let service = HttpService::new(client, InfluxDbWriteRequest::new(uri.clone(), token));
+        let service = ServiceBuilder::new()
+            .settings(request, http_response_retry_logic(RetryStrategy::Default))
+            .service(service);
+
+        let sink = InfluxDbLogsSink {
+            service,
+            batch_settings: *batch,
+            encoder,
+        };
+
+        Ok((VectorSink::from_event_streamsink(sink), healthcheck))
+    }
+}
+
+struct InfluxDbLogsEncoder {
+    protocol_version: ProtocolVersion,
+    measurement: String,
+    tags: HashSet<KeyString>,
+    transformer: Transformer,
+    host_key: OwnedValuePath,
+    message_key: OwnedValuePath,
+    source_type_key: OwnedValuePath,
+}
+
+impl InfluxDbLogsEncoder {
+    fn encode_event(&mut self, event: Event) -> Option<BytesMut> {
+        let mut log = event.into_log();
+        // If the event isn't an object (`. = "foo"`), inserting or renaming will result in losing
+        // the original value that was assigned to the root. To avoid this we intentionally rename
+        // the path that points to "message" such that it has a dedicated key.
+        // TODO: add a `TargetPath::is_event_root()` to conditionally rename?
+        if let Some(message_path) = log.message_path().cloned().as_ref() {
+            log.rename_key(message_path, (PathPrefix::Event, &self.message_key));
+        }
+        // Add the `host` and `source_type` to the HashSet of tags to include
+        // Ensure those paths are on the event to be encoded, rather than metadata
+        if let Some(host_path) = log.host_path().cloned().as_ref() {
+            self.tags.replace(host_path.path.to_string().into());
+            log.rename_key(host_path, (PathPrefix::Event, &self.host_key));
+        }
+
+        if let Some(source_type_path) = log.source_type_path().cloned().as_ref() {
+            self.tags.replace(source_type_path.path.to_string().into());
+            log.rename_key(source_type_path, (PathPrefix::Event, &self.source_type_key));
+        }
+
+        self.tags.replace("metric_type".into());
+        log.insert(event_path!("metric_type"), "logs");
+
+        // Timestamp
+        let timestamp = encode_timestamp(match log.remove_timestamp() {
+            Some(Value::Timestamp(ts)) => Some(ts),
+            _ => None,
+        });
+
+        let log = {
+            let mut event = Event::from(log);
+            self.transformer.transform(&mut event);
+            event.into_log()
+        };
+
+        // Tags + Fields
+        let mut tags = MetricTags::default();
+        let mut fields: HashMap<KeyString, Field> = HashMap::new();
+        log.convert_to_fields().for_each(|(key, value)| {
+            if self.tags.contains(key.as_str()) {
+                tags.replace(key.into(), value.to_string_lossy().into_owned());
+            } else {
+                fields.insert(key, to_field(value));
+            }
+        });
+
+        let mut output = BytesMut::new();
+        if let Err(error_message) = influx_line_protocol(
+            self.protocol_version,
+            &self.measurement,
+            Some(tags),
+            Some(fields),
+            timestamp,
+            &mut output,
+        ) {
+            emit(InfluxdbEncodingError {
+                error_message,
+                count: 1,
+            });
+            return None;
+        }
+
+        Some(output)
+    }
+}
+
+impl HttpServiceRequestBuilder<()> for InfluxDbWriteRequest {
+    fn build(&self, mut request: HttpRequest<()>) -> crate::Result<http::Request<Bytes>> {
+        self.request(request.take_payload())
+    }
+}
+
+/// An event encoded as one line of the line protocol, with the accounting of the original event.
+struct EncodedLine {
+    line: BytesMut,
+    finalizers: EventFinalizers,
+    byte_size: usize,
+    json_size: JsonSize,
+}
+
+/// The lines of one write request.
+///
+/// The finalizers and the event accounting also cover events dropped for exceeding `max_bytes`.
+/// They are completed and reported with the request of the batch they were dropped from, even if
+/// that request has no lines.
+#[derive(Default)]
+struct LogBatch {
+    lines: Vec<BytesMut>,
+    finalizers: EventFinalizers,
+    count: usize,
+    byte_size: usize,
+    json_size: JsonSize,
+}
+
+/// Batches lines by their encoded size.
+///
+/// A line longer than `max_bytes` is dropped if it would start a batch, and does not count towards
+/// `max_events`.
+struct LogBatchConfig {
+    batch: LogBatch,
+    batch_bytes: usize,
+    is_full: bool,
+    settings: BatcherSettings,
+}
+
+impl LogBatchConfig {
+    fn new(settings: BatcherSettings) -> Self {
+        Self {
+            batch: LogBatch::default(),
+            batch_bytes: 0,
+            is_full: false,
+            settings,
+        }
+    }
+}
+
+impl StreamBatchConfig<EncodedLine> for LogBatchConfig {
+    type ItemMetadata = ();
+    type Batch = LogBatch;
+
+    fn len(&self) -> usize {
+        self.batch.count
+    }
+
+    fn take_batch(&mut self) -> LogBatch {
+        self.batch_bytes = 0;
+        self.is_full = false;
+        mem::take(&mut self.batch)
+    }
+
+    fn push(&mut self, item: EncodedLine, (): ()) {
+        let EncodedLine {
+            line,
+            finalizers,
+            byte_size,
+            json_size,
+        } = item;
+        self.batch.finalizers.merge(finalizers);
+        self.batch.count += 1;
+        self.batch.byte_size += byte_size;
+        self.batch.json_size += json_size;
+
+        let max_bytes = self.settings.size_limit;
+        if self.batch.lines.is_empty() && line.len() > max_bytes {
+            emit(LargeEventDroppedError {
+                length: line.len(),
+                max_length: max_bytes,
+            });
+        } else {
+            self.batch_bytes += line.len();
+            self.batch.lines.push(line);
+            self.is_full =
+                self.batch.lines.len() >= self.settings.item_limit || self.batch_bytes >= max_bytes;
+        }
+    }
+
+    fn is_batch_full(&self) -> bool {
+        self.is_full
+    }
+
+    fn item_fits_in_batch(&self, item: &EncodedLine) -> (bool, ()) {
+        let fits = self.batch.lines.is_empty()
+            || (self.batch.lines.len() < self.settings.item_limit
+                && self.batch_bytes + item.line.len() <= self.settings.size_limit);
+        (fits, ())
+    }
+
+    fn timeout(&self) -> Duration {
+        self.settings.timeout
+    }
+}
+
+/// The lines of a batch and the accounting of their original events.
+struct LogLines {
+    lines: Vec<BytesMut>,
+    json_size: GroupedCountByteSize,
+}
+
+struct LogLinesEncoder;
+
+impl SinkEncoder<LogLines> for LogLinesEncoder {
+    fn encode_input(
+        &self,
+        input: LogLines,
+        writer: &mut dyn io::Write,
+    ) -> io::Result<(usize, GroupedCountByteSize)> {
+        let LogLines { lines, json_size } = input;
+        let mut written = 0;
+        for line in &lines {
+            write_all(writer, lines.len(), line)?;
+            written += line.len();
+        }
+        Ok((written, json_size))
+    }
+}
+
+struct InfluxDbLogsRequestBuilder {
+    encoder: LogLinesEncoder,
+}
+
+impl RequestBuilder<LogBatch> for InfluxDbLogsRequestBuilder {
+    type Metadata = EventFinalizers;
+    type Events = LogLines;
+    type Encoder = LogLinesEncoder;
+    type Payload = Bytes;
+    type Request = HttpRequest<()>;
+    type Error = io::Error;
+
+    fn compression(&self) -> Compression {
+        Compression::None
+    }
+
+    fn encoder(&self) -> &Self::Encoder {
+        &self.encoder
+    }
+
+    fn split_input(
+        &self,
+        batch: LogBatch,
+    ) -> (Self::Metadata, RequestMetadataBuilder, Self::Events) {
+        let LogBatch {
+            lines,
+            finalizers,
+            count,
+            byte_size,
+            json_size,
+        } = batch;
+        // Events are reported untagged, with the estimated JSON size of the original events.
+        let json_size = GroupedCountByteSize::from(CountByteSize(count, json_size));
+        let builder = RequestMetadataBuilder::new(count, byte_size, json_size.clone());
+        (finalizers, builder, LogLines { lines, json_size })
+    }
+
+    fn build_request(
+        &self,
+        finalizers: Self::Metadata,
+        metadata: RequestMetadata,
+        payload: EncodeResult<Self::Payload>,
+    ) -> Self::Request {
+        HttpRequest::new(payload.into_payload(), finalizers, metadata, ())
+    }
+}
+
+struct InfluxDbLogsSink<S> {
+    service: S,
+    batch_settings: BatcherSettings,
+    encoder: InfluxDbLogsEncoder,
+}
+
+impl<S> InfluxDbLogsSink<S>
+where
+    S: Service<HttpRequest<()>> + Send + 'static,
+    S::Future: Send + 'static,
+    S::Response: DriverResponse + Send + 'static,
+    S::Error: fmt::Debug + Into<crate::Error> + Send,
+{
+    async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
+        let Self {
+            service,
+            batch_settings,
+            mut encoder,
+        } = *self;
+
+        input
+            .filter_map(move |mut event| {
+                let byte_size = event.size_of();
+                let json_size = event.estimated_json_encoded_size_of();
+                let finalizers = event.metadata_mut().take_finalizers();
+                // Events that fail to encode are dropped along with their finalizers.
+                future::ready(encoder.encode_event(event).map(|line| EncodedLine {
+                    line,
+                    finalizers,
+                    byte_size,
+                    json_size,
+                }))
+            })
+            .batched(LogBatchConfig::new(batch_settings))
+            .request_builder(
+                default_request_builder_concurrency_limit(),
+                InfluxDbLogsRequestBuilder {
+                    encoder: LogLinesEncoder,
+                },
+            )
+            .filter_map(|request| async move {
+                match request {
+                    Err(error) => {
+                        emit(SinkRequestBuildError { error });
+                        None
+                    }
+                    Ok(request) => Some(request),
+                }
+            })
+            .into_driver(service)
+            // Requests that still fail after retries leave their events errored, as before.
+            .with_request_error_status(EventStatus::Errored)
+            .run()
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl<S> StreamSink<Event> for InfluxDbLogsSink<S>
+where
+    S: Service<HttpRequest<()>> + Send + 'static,
+    S::Future: Send + 'static,
+    S::Response: DriverResponse + Send + 'static,
+    S::Error: fmt::Debug + Into<crate::Error> + Send,
+{
+    async fn run(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
+        self.run_inner(input).await
+    }
+}
+
+impl InfluxDbLogsConfig {
+    fn get_measurement(&self) -> Result<String, &'static str> {
+        self.measurement
+            .clone()
+            .ok_or("The `measurement` option is required.")
+    }
+
+    fn healthcheck(&self, client: HttpClient) -> crate::Result<Healthcheck> {
+        let config = self.clone();
+
+        let healthcheck = healthcheck(config.endpoint, config.settings, client)?;
+
+        Ok(healthcheck)
+    }
+}
+
+fn to_field(value: &Value) -> Field {
+    match value {
+        Value::Integer(num) => Field::Int(*num),
+        Value::Float(num) => Field::Float(num.into_inner()),
+        Value::Boolean(b) => Field::Bool(*b),
+        _ => Field::String(value.to_string_lossy().into_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use chrono::{Utc, offset::TimeZone};
+    use futures::{StreamExt, channel::mpsc, stream};
+    use http::{StatusCode, request::Parts};
+    use indoc::indoc;
+    use vector_lib::{
+        event::{BatchNotifier, BatchStatus, Event, LogEvent},
+        finalization::{BatchStatusReceiver, EventFinalizer, EventStatus},
+        lookup::owned_value_path,
+    };
+
+    use super::*;
+    use crate::{
+        config::ValidatedSink,
+        sinks::{
+            influxdb::{
+                InfluxDb2Settings,
+                test_util::{assert_fields, split_line_protocol, ts},
+            },
+            util::test::{build_test_server_status, load_sink},
+        },
+        test_util::{
+            addr::next_addr,
+            components::{
+                COMPONENT_ERROR_TAGS, HTTP_SINK_TAGS, run_and_assert_sink_compliance,
+                run_and_assert_sink_error,
+            },
+        },
+    };
+
+    type Receiver = mpsc::Receiver<(Parts, bytes::Bytes)>;
+
+    #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<InfluxDbLogsConfig>();
+    }
+
+    #[test]
+    fn test_config_without_tags() {
+        let config = indoc! {r#"
+            measurement: "vector-logs"
+            endpoint: "http://localhost:9999"
+            version: "2"
+            bucket: "my-bucket"
+            org: "my-org"
+            token: "my-token"
+        "#};
+
+        serde_yaml::from_str::<InfluxDbLogsConfig>(config).unwrap();
+    }
+
+    #[test]
+    fn test_config_measurement_required() {
+        let config = indoc! {r#"
+            endpoint: "http://localhost:9999"
+            version: "2"
+            bucket: "my-bucket"
+            org: "my-org"
+            token: "my-token"
+        "#};
+
+        let sink_config = serde_yaml::from_str::<InfluxDbLogsConfig>(config).unwrap();
+        assert_eq!(
+            Err("The `measurement` option is required."),
+            sink_config.get_measurement()
+        );
+    }
+
+    #[test]
+    fn test_config_version_selects_settings() {
+        let config = indoc! {r#"
+            measurement: "vector-logs"
+            endpoint: "http://localhost:8086"
+            version: "1"
+            database: "my-database"
+        "#};
+        let config = serde_yaml::from_str::<InfluxDbLogsConfig>(config).unwrap();
+        assert!(matches!(config.settings, InfluxDbSettings::V1(_)));
+
+        let config = indoc! {r#"
+            measurement: "vector-logs"
+            endpoint: "http://localhost:9999"
+            version: "2"
+            org: "my-org"
+            bucket: "my-bucket"
+            token: "my-token"
+        "#};
+        let config = serde_yaml::from_str::<InfluxDbLogsConfig>(config).unwrap();
+        assert!(matches!(config.settings, InfluxDbSettings::V2(_)));
+    }
+
+    #[test]
+    fn test_config_v1_settings_in_write_uri() {
+        let config = indoc! {r#"
+            measurement: "vector-logs"
+            endpoint: "http://localhost:8086"
+            version: "1"
+            database: "my-database"
+            consistency: "quorum"
+            retention_policy_name: "autogen"
+            username: "my-user"
+            password: "my-password"
+        "#};
+        let config = serde_yaml::from_str::<InfluxDbLogsConfig>(config).unwrap();
+        assert_eq!(
+            config.validate().unwrap().uri.to_string(),
+            "http://localhost:8086/write?consistency=quorum&db=my-database&rp=autogen&p=my-password&u=my-user&precision=ns"
+        );
+    }
+
+    #[test]
+    fn test_config_version_required() {
+        let config = indoc! {r#"
+            measurement: "vector-logs"
+            endpoint: "http://localhost:9999"
+            org: "my-org"
+            bucket: "my-bucket"
+            token: "my-token"
+        "#};
+        let error = serde_yaml::from_str::<InfluxDbLogsConfig>(config).unwrap_err();
+        assert!(
+            error.to_string().contains("missing field `version`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_config_version_rejects_invalid_values() {
+        // Use the regular config loading path: it parses into an intermediate value, which is
+        // where an unquoted integer could otherwise be read as a variant index.
+        for (version, expected) in [
+            ("0", "invalid type: integer"),
+            ("1", "invalid type: integer"),
+            ("2", "invalid type: integer"),
+            ("3", "invalid type: integer"),
+            ("\"x\"", "unknown variant `x`"),
+        ] {
+            let config = format!(
+                "measurement: vector-logs\nendpoint: http://localhost:9999\nversion: {version}\norg: my-org\nbucket: my-bucket\ntoken: my-token\n"
+            );
+            let errors = crate::config::loading::load::<_, InfluxDbLogsConfig>(
+                config.as_bytes(),
+                crate::config::Format::Yaml,
+            )
+            .unwrap_err();
+            let error = errors.join("\n");
+            assert!(error.contains(expected), "version {version}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_config_version_requires_settings() {
+        for (config, field) in [
+            (
+                indoc! {r#"
+                    measurement: "vector-logs"
+                    endpoint: "http://localhost:8086"
+                    version: "1"
+                "#},
+                "database",
+            ),
+            (
+                indoc! {r#"
+                    measurement: "vector-logs"
+                    endpoint: "http://localhost:9999"
+                    version: "2"
+                    bucket: "my-bucket"
+                    token: "my-token"
+                "#},
+                "org",
+            ),
+        ] {
+            let error = serde_yaml::from_str::<InfluxDbLogsConfig>(config).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("missing field `{field}`")),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_fields() {
+        let v2 = indoc! {r#"
+            measurement: "vector-logs"
+            endpoint: "http://localhost:9999"
+            version: "2"
+            org: "my-org"
+            bucket: "my-bucket"
+            token: "my-token"
+        "#};
+        for (extra, field) in [
+            ("database: my-database", "database"),
+            ("database: null", "database"),
+            ("database:", "database"),
+            ("bukcet: my-bucket", "bukcet"),
+            ("bukcet: null", "bukcet"),
+            ("endpont: http://localhost:9999", "endpont"),
+        ] {
+            let config = format!("{v2}{extra}\n");
+            let error = serde_yaml::from_str::<InfluxDbLogsConfig>(&config).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{field}`")),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_accepts_null_optional_settings() {
+        let config = indoc! {r#"
+            measurement: "vector-logs"
+            endpoint: "http://localhost:8086"
+            version: "1"
+            database: "my-database"
+            password: null
+        "#};
+        let config = serde_yaml::from_str::<InfluxDbLogsConfig>(config).unwrap();
+        assert!(matches!(config.settings, InfluxDbSettings::V1(_)));
+    }
+
+    #[test]
+    fn test_config_rejects_null_required_settings() {
+        let config = indoc! {r#"
+            measurement: "vector-logs"
+            endpoint: "http://localhost:9999"
+            version: "2"
+            org: "my-org"
+            bucket: "my-bucket"
+            token: null
+        "#};
+        let error = serde_yaml::from_str::<InfluxDbLogsConfig>(config).unwrap_err();
+        assert!(error.to_string().contains("invalid type: null"), "{error}");
+    }
+
+    fn v2_settings() -> InfluxDbSettings {
+        InfluxDbSettings::V2(InfluxDb2Settings {
+            org: "my-org".to_string(),
+            bucket: "my-bucket".to_string(),
+            token: "my-token".to_string().into(),
+        })
+    }
+
+    #[test]
+    fn prepares_valid_config() {
+        let config = InfluxDbLogsConfig {
+            measurement: Some("vector".to_string()),
+            endpoint: HttpEndpoint::parse("http://localhost:9999").unwrap(),
+            settings: v2_settings(),
+            tags: vec![],
+            encoding: Transformer::default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            host_key: None,
+            message_key: None,
+            source_type_key: None,
+        };
+
+        let validated = config.validate().expect("preparation should succeed");
+        assert_eq!(validated.measurement, "vector");
+        assert!(matches!(validated.protocol_version, ProtocolVersion::V2));
+        assert_eq!(
+            validated.uri.to_string(),
+            "http://localhost:9999/api/v2/write?org=my-org&bucket=my-bucket&precision=ns"
+        );
+    }
+
+    #[test]
+    fn validate_retains_config_keys_without_log_schema_fallback() {
+        let config = InfluxDbLogsConfig {
+            measurement: Some("vector".to_string()),
+            endpoint: HttpEndpoint::parse("http://localhost:9999").unwrap(),
+            settings: v2_settings(),
+            host_key: Some(OptionalValuePath::new("custom_host")),
+            tags: vec![],
+            encoding: Transformer::default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            message_key: None,
+            source_type_key: None,
+        };
+
+        let validated = config.validate().expect("validation should succeed");
+        // Config-provided keys are retained...
+        assert_eq!(validated.host_key, Some(owned_value_path!("custom_host")));
+        // ...but unset keys stay unset: `validate` must not resolve the global
+        // `log_schema()` defaults, which aren't initialized yet at validation
+        // time in the startup path. The fallbacks are resolved in `build`.
+        assert_eq!(validated.message_key, None);
+        assert_eq!(validated.source_type_key, None);
+    }
+
+    #[test]
+    fn test_encode_event_apply_rules() {
+        let mut event = Event::Log(LogEvent::from("hello"));
+        event
+            .as_mut_log()
+            .insert(event_path!("host"), "aws.cloud.eur");
+        event.as_mut_log().insert(event_path!("timestamp"), ts());
+
+        let mut encoder = create_encoder(
+            ProtocolVersion::V1,
+            "vector",
+            ["metric_type", "host"].to_vec(),
+        );
+        encoder
+            .transformer
+            .set_except_fields(Some(vec!["host".into()]))
+            .unwrap();
+
+        let bytes = encoder.encode_event(event.clone()).unwrap();
+        let string = std::str::from_utf8(&bytes).unwrap();
+
+        let line_protocol = split_line_protocol(string);
+        assert_eq!("vector", line_protocol.0);
+        assert_eq!("metric_type=logs", line_protocol.1);
+        assert_fields(&line_protocol.2, ["message=\"hello\""].to_vec());
+        assert_eq!("1542182950000000011\n", line_protocol.3);
+
+        let mut encoder = create_encoder(
+            ProtocolVersion::V1,
+            "vector",
+            ["metric_type", "host"].to_vec(),
+        );
+        encoder
+            .transformer
+            .set_except_fields(Some(vec!["metric_type".into()]))
+            .unwrap();
+        let bytes = encoder.encode_event(event.clone()).unwrap();
+        let string = std::str::from_utf8(&bytes).unwrap();
+        let line_protocol = split_line_protocol(string);
+        assert_eq!(
+            "host=aws.cloud.eur", line_protocol.1,
+            "metric_type tag should be excluded"
+        );
+        assert_fields(&line_protocol.2, ["message=\"hello\""].to_vec());
+    }
+
+    #[test]
+    fn test_encode_event_v1() {
+        let mut event = Event::Log(LogEvent::from("hello"));
+        event
+            .as_mut_log()
+            .insert(event_path!("host"), "aws.cloud.eur");
+        event
+            .as_mut_log()
+            .insert(event_path!("source_type"), "file");
+
+        event.as_mut_log().insert(event_path!("int"), 4i32);
+        event.as_mut_log().insert(event_path!("float"), 5.5);
+        event.as_mut_log().insert(event_path!("bool"), true);
+        event
+            .as_mut_log()
+            .insert(event_path!("string"), "thisisastring");
+        event.as_mut_log().insert(event_path!("timestamp"), ts());
+
+        let mut encoder = create_encoder(
+            ProtocolVersion::V1,
+            "vector",
+            ["source_type", "host", "metric_type"].to_vec(),
+        );
+
+        let bytes = encoder.encode_event(event).unwrap();
+        let string = std::str::from_utf8(&bytes).unwrap();
+
+        let line_protocol = split_line_protocol(string);
+        assert_eq!("vector", line_protocol.0);
+        assert_eq!(
+            "host=aws.cloud.eur,metric_type=logs,source_type=file",
+            line_protocol.1
+        );
+        assert_fields(
+            &line_protocol.2,
+            [
+                "int=4i",
+                "float=5.5",
+                "bool=true",
+                "string=\"thisisastring\"",
+                "message=\"hello\"",
+            ]
+            .to_vec(),
+        );
+
+        assert_eq!("1542182950000000011\n", line_protocol.3);
+    }
+
+    #[test]
+    fn test_encode_event() {
+        let mut event = Event::Log(LogEvent::from("hello"));
+        event
+            .as_mut_log()
+            .insert(event_path!("host"), "aws.cloud.eur");
+        event
+            .as_mut_log()
+            .insert(event_path!("source_type"), "file");
+
+        event.as_mut_log().insert(event_path!("int"), 4i32);
+        event.as_mut_log().insert(event_path!("float"), 5.5);
+        event.as_mut_log().insert(event_path!("bool"), true);
+        event
+            .as_mut_log()
+            .insert(event_path!("string"), "thisisastring");
+        event.as_mut_log().insert(event_path!("timestamp"), ts());
+
+        let mut encoder = create_encoder(
+            ProtocolVersion::V2,
+            "vector",
+            ["source_type", "host", "metric_type"].to_vec(),
+        );
+
+        let bytes = encoder.encode_event(event).unwrap();
+        let string = std::str::from_utf8(&bytes).unwrap();
+
+        let line_protocol = split_line_protocol(string);
+        assert_eq!("vector", line_protocol.0);
+        assert_eq!(
+            "host=aws.cloud.eur,metric_type=logs,source_type=file",
+            line_protocol.1
+        );
+        assert_fields(
+            &line_protocol.2,
+            [
+                "int=4i",
+                "float=5.5",
+                "bool=true",
+                "string=\"thisisastring\"",
+                "message=\"hello\"",
+            ]
+            .to_vec(),
+        );
+
+        assert_eq!("1542182950000000011\n", line_protocol.3);
+    }
+
+    #[test]
+    fn test_encode_event_without_tags() {
+        let mut event = Event::Log(LogEvent::from("hello"));
+
+        event.as_mut_log().insert(event_path!("value"), 100);
+        event.as_mut_log().insert(event_path!("timestamp"), ts());
+
+        let mut encoder = create_encoder(ProtocolVersion::V2, "vector", [].to_vec());
+        // exclude default metric_type tag so to emit empty tags
+        encoder
+            .transformer
+            .set_except_fields(Some(vec!["metric_type".into()]))
+            .unwrap();
+
+        let bytes = encoder.encode_event(event).unwrap();
+        let line = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            line.starts_with("vector "),
+            "measurement (without tags) should ends with space ' '"
+        );
+
+        let line_protocol = split_line_protocol(line);
+        assert_eq!("vector", line_protocol.0);
+        assert_eq!("", line_protocol.1, "tags should be empty");
+        assert_fields(
+            &line_protocol.2,
+            ["value=100i", "message=\"hello\""].to_vec(),
+        );
+
+        assert_eq!("1542182950000000011\n", line_protocol.3);
+    }
+
+    #[test]
+    fn test_encode_nested_fields() {
+        let mut event = LogEvent::default();
+
+        event.insert(event_path!("a"), 1);
+        event.insert(event_path!("nested", "field"), "2");
+        event.insert(event_path!("nested", "bool"), true);
+        event.insert(event_path!("nested", "array", 0isize), "example-value");
+        event.insert(event_path!("nested", "array", 2isize), "another-value");
+        event.insert(event_path!("nested", "array", 3isize), 15);
+
+        let mut encoder = create_encoder(ProtocolVersion::V2, "vector", ["metric_type"].to_vec());
+
+        let bytes = encoder.encode_event(event.into()).unwrap();
+        let string = std::str::from_utf8(&bytes).unwrap();
+
+        let line_protocol = split_line_protocol(string);
+        assert_eq!("vector", line_protocol.0);
+        assert_eq!("metric_type=logs", line_protocol.1);
+        assert_fields(
+            &line_protocol.2,
+            [
+                "a=1i",
+                "nested.array[0]=\"example-value\"",
+                "nested.array[1]=\"<null>\"",
+                "nested.array[2]=\"another-value\"",
+                "nested.array[3]=15i",
+                "nested.bool=true",
+                "nested.field=\"2\"",
+            ]
+            .to_vec(),
+        );
+    }
+
+    #[test]
+    fn test_add_tag() {
+        let mut event = Event::Log(LogEvent::from("hello"));
+        event
+            .as_mut_log()
+            .insert(event_path!("source_type"), "file");
+
+        event.as_mut_log().insert(event_path!("as_a_tag"), 10);
+        event.as_mut_log().insert(event_path!("timestamp"), ts());
+
+        let mut encoder = create_encoder(
+            ProtocolVersion::V2,
+            "vector",
+            ["as_a_tag", "not_exists_field", "source_type", "metric_type"].to_vec(),
+        );
+
+        let bytes = encoder.encode_event(event).unwrap();
+        let string = std::str::from_utf8(&bytes).unwrap();
+
+        let line_protocol = split_line_protocol(string);
+        assert_eq!("vector", line_protocol.0);
+        assert_eq!(
+            "as_a_tag=10,metric_type=logs,source_type=file",
+            line_protocol.1
+        );
+        assert_fields(&line_protocol.2, ["message=\"hello\""].to_vec());
+
+        assert_eq!("1542182950000000011\n", line_protocol.3);
+    }
+
+    #[tokio::test]
+    async fn smoke_v1() {
+        let rx = smoke_test(
+            indoc! {r#"
+            version = "1"
+            database = "my-database"
+        "#},
+            StatusCode::OK,
+            BatchStatus::Delivered,
+        )
+        .await;
+
+        let query = receive_response(rx).await;
+        assert!(query.contains("db=my-database"));
+        assert!(query.contains("precision=ns"));
+    }
+
+    #[tokio::test]
+    async fn smoke_v1_failure() {
+        smoke_test(
+            indoc! {r#"
+            version = "1"
+            database = "my-database"
+        "#},
+            StatusCode::BAD_REQUEST,
+            BatchStatus::Rejected,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn smoke_v2() {
+        let rx = smoke_test(
+            indoc! {r#"
+            version = "2"
+            bucket = "my-bucket"
+            org = "my-org"
+            token = "my-token"
+        "#},
+            StatusCode::OK,
+            BatchStatus::Delivered,
+        )
+        .await;
+
+        let query = receive_response(rx).await;
+        assert!(query.contains("org=my-org"));
+        assert!(query.contains("bucket=my-bucket"));
+        assert!(query.contains("precision=ns"));
+    }
+
+    #[tokio::test]
+    async fn smoke_v2_failure() {
+        smoke_test(
+            indoc! {r#"
+            version = "2"
+            bucket = "my-bucket"
+            org = "my-org"
+            token = "my-token"
+        "#},
+            StatusCode::BAD_REQUEST,
+            BatchStatus::Rejected,
+        )
+        .await;
+    }
+
+    async fn smoke_test(
+        config: &str,
+        status_code: StatusCode,
+        batch_status: BatchStatus,
+    ) -> Receiver {
+        let config = format!(
+            indoc! {r#"
+            measurement = "vector"
+            endpoint = "http://localhost:9999"
+            {}
+        "#},
+            config
+        );
+        let (mut config, cx) = load_sink::<InfluxDbLogsConfig>(&config).unwrap();
+
+        // Make sure we can build the config
+        _ = SinkConfig::build(&config, cx.clone()).await.unwrap();
+
+        let (_guard, addr) = next_addr();
+        // Swap out the host so we can force send it
+        // to our local server
+        let host = format!("http://{addr}");
+        config.endpoint = HttpEndpoint::parse(&host).unwrap();
+
+        let (sink, _) = SinkConfig::build(&config, cx).await.unwrap();
+
+        let (rx, _trigger, server) = build_test_server_status(addr, status_code);
+        tokio::spawn(server);
+
+        let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+
+        let lines = std::iter::repeat(())
+            .map(move |()| "message_value")
+            .take(5)
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+
+        // Create 5 events with custom field
+        for (i, line) in lines.iter().enumerate() {
+            let mut event = LogEvent::from(line.to_string()).with_batch_notifier(&batch);
+            event.insert(event_path!(format!("key{i}").as_str()), format!("value{i}"));
+
+            let timestamp = Utc
+                .with_ymd_and_hms(
+                    1970,
+                    1,
+                    1,
+                    0,
+                    0,
+                    u32::try_from(i).expect("test index fits in u32") + 1,
+                )
+                .single()
+                .expect("invalid timestamp");
+            event.insert(event_path!("timestamp"), timestamp);
+            event.insert(event_path!("source_type"), "file");
+
+            events.push(Event::Log(event));
+        }
+        drop(batch);
+
+        if batch_status == BatchStatus::Delivered {
+            run_and_assert_sink_compliance(sink, stream::iter(events), &HTTP_SINK_TAGS).await;
+        } else {
+            run_and_assert_sink_error(sink, stream::iter(events), &COMPONENT_ERROR_TAGS).await;
+        }
+
+        assert_eq!(receiver.try_recv(), Ok(batch_status));
+
+        rx
+    }
+
+    async fn receive_response(mut rx: Receiver) -> String {
+        let output = rx.next().await.unwrap();
+
+        let request = &output.0;
+        let query = request.uri.query().unwrap();
+
+        let body = std::str::from_utf8(&output.1[..]).unwrap();
+        let mut lines = body.lines();
+
+        assert_eq!(5, lines.clone().count());
+        assert_line_protocol(0, lines.next());
+
+        query.into()
+    }
+
+    fn assert_line_protocol(i: i64, value: Option<&str>) {
+        //vector,metric_type=logs key0="value0",message="message_value" 1000000000
+        let line_protocol = split_line_protocol(value.unwrap());
+        assert_eq!("vector", line_protocol.0);
+        assert_eq!("metric_type=logs,source_type=file", line_protocol.1);
+        assert_fields(
+            &line_protocol.2,
+            [
+                &*format!("key{i}=\"value{i}\""),
+                "message=\"message_value\"",
+            ]
+            .to_vec(),
+        );
+
+        assert_eq!(((i + 1) * 1_000_000_000).to_string(), line_protocol.3);
+    }
+
+    fn create_encoder(
+        protocol_version: ProtocolVersion,
+        measurement: &str,
+        tags: Vec<&str>,
+    ) -> InfluxDbLogsEncoder {
+        InfluxDbLogsEncoder {
+            protocol_version,
+            measurement: measurement.to_string(),
+            tags: tags.into_iter().map(Into::into).collect(),
+            transformer: Transformer::default(),
+            host_key: owned_value_path!("host"),
+            message_key: owned_value_path!("message"),
+            source_type_key: owned_value_path!("source_type"),
+        }
+    }
+
+    fn encoded_line(line: &str) -> (EncodedLine, BatchStatusReceiver) {
+        let (batch, receiver) = BatchNotifier::new_with_receiver();
+        let item = EncodedLine {
+            line: BytesMut::from(line),
+            finalizers: EventFinalizers::new(EventFinalizer::new(batch)),
+            byte_size: 1,
+            json_size: JsonSize::new(10),
+        };
+        (item, receiver)
+    }
+
+    async fn batch_lines(
+        lines: &[&str],
+        max_bytes: usize,
+        max_events: usize,
+    ) -> (Vec<LogBatch>, Vec<BatchStatusReceiver>) {
+        let (items, receivers): (Vec<_>, Vec<_>) =
+            lines.iter().map(|line| encoded_line(line)).unzip();
+        let settings = BatcherSettings::new(
+            Duration::from_secs(1),
+            NonZeroUsize::new(max_bytes).unwrap(),
+            NonZeroUsize::new(max_events).unwrap(),
+        );
+        let batches = stream::iter(items)
+            .batched(LogBatchConfig::new(settings))
+            .collect()
+            .await;
+        (batches, receivers)
+    }
+
+    fn lines_of(batches: &[LogBatch]) -> Vec<Vec<String>> {
+        batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .lines
+                    .iter()
+                    .map(|line| String::from_utf8_lossy(line).into_owned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn batches_lines_by_encoded_bytes() {
+        let (batches, _) = batch_lines(
+            &["aaaa\n", "bbbbbb\n", "cc\n", "dd\n", "eeeeee\n", "f\n"],
+            10,
+            100,
+        )
+        .await;
+
+        assert_eq!(
+            lines_of(&batches),
+            vec![
+                vec!["aaaa\n"],
+                vec!["bbbbbb\n", "cc\n"],
+                vec!["dd\n", "eeeeee\n"],
+                vec!["f\n"],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_line_is_finalized_and_counted_with_its_batch() {
+        let (batches, receivers) =
+            batch_lines(&["this line is too long\n", "a\n", "b\n", "c\n"], 10, 2).await;
+
+        assert_eq!(lines_of(&batches), vec![vec!["a\n", "b\n"], vec!["c\n"]]);
+        assert_eq!(
+            batches.iter().map(|batch| batch.count).collect::<Vec<_>>(),
+            [3, 1]
+        );
+        assert_eq!(batches[0].json_size, JsonSize::new(30));
+
+        batches[0].finalizers.update_status(EventStatus::Rejected);
+        batches[1].finalizers.update_status(EventStatus::Delivered);
+        drop(batches);
+
+        let statuses = receivers
+            .into_iter()
+            .map(|mut receiver| receiver.try_recv().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            [
+                BatchStatus::Rejected,
+                BatchStatus::Rejected,
+                BatchStatus::Rejected,
+                BatchStatus::Delivered,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_line_alone_yields_a_batch_without_lines() {
+        let (batches, mut receivers) =
+            batch_lines(&["a\n", "this line is too long\n"], 10, 100).await;
+
+        assert_eq!(lines_of(&batches), vec![vec!["a\n"], vec![]]);
+        assert_eq!(batches[1].count, 1);
+
+        batches[1].finalizers.update_status(EventStatus::Rejected);
+        drop(batches);
+        assert_eq!(receivers[1].try_recv(), Ok(BatchStatus::Rejected));
+    }
+}
+
+#[cfg(feature = "influxdb-integration-tests")]
+#[cfg(test)]
+mod integration_tests {
+    use std::sync::Arc;
+
+    use chrono::Utc;
+    use futures::stream;
+    use vector_lib::{
+        codecs::BytesDeserializerConfig,
+        config::{LegacyKey, LogNamespace},
+        event::{BatchNotifier, BatchStatus, Event, LogEvent},
+        lookup::{owned_value_path, path},
+    };
+    use vrl::value;
+
+    use super::*;
+    use crate::{
+        config::SinkContext,
+        sinks::influxdb::{
+            InfluxDb2Settings,
+            logs::InfluxDbLogsConfig,
+            test_util::{BUCKET, ORG, TOKEN, address_v2, onboarding_v2},
+        },
+        test_util::components::{HTTP_SINK_TAGS, run_and_assert_sink_compliance},
+    };
+
+    #[tokio::test]
+    // https://github.com/vectordotdev/vector/issues/23659
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the end-to-end log fixture together."
+    )]
+    async fn influxdb2_logs_put_data() {
+        let endpoint = address_v2();
+        onboarding_v2(&endpoint).await;
+
+        let now = Utc::now();
+        let measure = format!(
+            "vector-{}",
+            now.timestamp_nanos_opt().expect("Timestamp out of range")
+        );
+
+        let cx = SinkContext::default();
+
+        let config = InfluxDbLogsConfig {
+            measurement: Some(measure.clone()),
+            endpoint: HttpEndpoint::parse(&endpoint).unwrap(),
+            tags: Vec::default(),
+            settings: InfluxDbSettings::V2(InfluxDb2Settings {
+                org: ORG.to_string(),
+                bucket: BUCKET.to_string(),
+                token: TOKEN.to_string().into(),
+            }),
+            encoding: Transformer::default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            host_key: None,
+            message_key: None,
+            source_type_key: None,
+        };
+
+        let (sink, _) = SinkConfig::build(&config, cx).await.unwrap();
+
+        let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+
+        let mut event1 = LogEvent::from("message_1").with_batch_notifier(&batch);
+        event1.insert(event_path!("host"), "aws.cloud.eur");
+        event1.insert(event_path!("source_type"), "file");
+
+        let mut event2 = LogEvent::from("message_2").with_batch_notifier(&batch);
+        event2.insert(event_path!("host"), "aws.cloud.eur");
+        event2.insert(event_path!("source_type"), "file");
+
+        let mut namespaced_log =
+            LogEvent::from(value!("namespaced message")).with_batch_notifier(&batch);
+        LogNamespace::Vector.insert_source_metadata(
+            "file",
+            &mut namespaced_log,
+            Some(LegacyKey::Overwrite(path!("host"))),
+            path!("host"),
+            "aws.cloud.eur",
+        );
+        LogNamespace::Vector.insert_standard_vector_source_metadata(
+            &mut namespaced_log,
+            "file",
+            now,
+        );
+        let schema = BytesDeserializerConfig
+            .schema_definition(LogNamespace::Vector)
+            .with_metadata_field(
+                &owned_value_path!("file", "host"),
+                Kind::bytes(),
+                Some("host"),
+            );
+        namespaced_log
+            .metadata_mut()
+            .set_schema_definition(&Arc::new(schema));
+
+        drop(batch);
+
+        let input_logs = vec![
+            Event::Log(event1),
+            Event::Log(event2),
+            Event::Log(namespaced_log),
+        ];
+
+        run_and_assert_sink_compliance(sink, stream::iter(input_logs), &HTTP_SINK_TAGS).await;
+
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
+
+        let mut body = std::collections::HashMap::new();
+        body.insert("query", format!("from(bucket:\"my-bucket\") |> range(start: 0) |> filter(fn: (r) => r._measurement == \"{}\")", measure.clone()));
+        body.insert("type", "flux".to_owned());
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+
+        let res = client
+            .post(format!("{endpoint}/api/v2/query?org=my-org"))
+            .json(&body)
+            .header("accept", "application/json")
+            .header("Authorization", "Token my-token")
+            .send()
+            .await
+            .unwrap();
+        let string = res.text().await.unwrap();
+
+        let lines = string.split('\n').collect::<Vec<&str>>();
+        let header = lines[0].split(',').collect::<Vec<&str>>();
+        let record1 = lines[1].split(',').collect::<Vec<&str>>();
+        let record2 = lines[2].split(',').collect::<Vec<&str>>();
+        let record_ns = lines[3].split(',').collect::<Vec<&str>>();
+
+        // measurement
+        assert_eq!(
+            record1[header
+                .iter()
+                .position(|&r| r.trim() == "_measurement")
+                .unwrap()]
+            .trim(),
+            measure.clone()
+        );
+        assert_eq!(
+            record2[header
+                .iter()
+                .position(|&r| r.trim() == "_measurement")
+                .unwrap()]
+            .trim(),
+            measure.clone()
+        );
+        assert_eq!(
+            record_ns[header
+                .iter()
+                .position(|&r| r.trim() == "_measurement")
+                .unwrap()]
+            .trim(),
+            measure.clone()
+        );
+
+        // tags
+        assert_eq!(
+            record1[header
+                .iter()
+                .position(|&r| r.trim() == "metric_type")
+                .unwrap()]
+            .trim(),
+            "logs"
+        );
+        assert_eq!(
+            record2[header
+                .iter()
+                .position(|&r| r.trim() == "metric_type")
+                .unwrap()]
+            .trim(),
+            "logs"
+        );
+        assert_eq!(
+            record_ns[header
+                .iter()
+                .position(|&r| r.trim() == "metric_type")
+                .unwrap()]
+            .trim(),
+            "logs"
+        );
+        assert_eq!(
+            record1[header.iter().position(|&r| r.trim() == "host").unwrap()].trim(),
+            "aws.cloud.eur"
+        );
+        assert_eq!(
+            record2[header.iter().position(|&r| r.trim() == "host").unwrap()].trim(),
+            "aws.cloud.eur"
+        );
+        assert_eq!(
+            record_ns[header.iter().position(|&r| r.trim() == "host").unwrap()].trim(),
+            "aws.cloud.eur"
+        );
+        assert_eq!(
+            record1[header
+                .iter()
+                .position(|&r| r.trim() == "source_type")
+                .unwrap()]
+            .trim(),
+            "file"
+        );
+        assert_eq!(
+            record2[header
+                .iter()
+                .position(|&r| r.trim() == "source_type")
+                .unwrap()]
+            .trim(),
+            "file"
+        );
+        assert_eq!(
+            record_ns[header
+                .iter()
+                .position(|&r| r.trim() == "source_type")
+                .unwrap()]
+            .trim(),
+            "file"
+        );
+
+        // field
+        assert_eq!(
+            record1[header.iter().position(|&r| r.trim() == "_field").unwrap()].trim(),
+            "message"
+        );
+        assert_eq!(
+            record2[header.iter().position(|&r| r.trim() == "_field").unwrap()].trim(),
+            "message"
+        );
+        assert_eq!(
+            record_ns[header.iter().position(|&r| r.trim() == "_field").unwrap()].trim(),
+            "message"
+        );
+        assert_eq!(
+            record1[header.iter().position(|&r| r.trim() == "_value").unwrap()].trim(),
+            "message_1"
+        );
+        assert_eq!(
+            record2[header.iter().position(|&r| r.trim() == "_value").unwrap()].trim(),
+            "message_2"
+        );
+        assert_eq!(
+            record_ns[header.iter().position(|&r| r.trim() == "_value").unwrap()].trim(),
+            "namespaced message"
+        );
+    }
+}

@@ -1,317 +1,178 @@
+pub mod adaptive_concurrency;
+pub mod auth;
+// https://github.com/mcarton/rust-derivative/issues/112
+#[allow(clippy::non_canonical_clone_impl)]
 pub mod batch;
 pub mod buffer;
+pub mod builder;
+pub mod compressor;
+pub mod datagram;
+pub mod encoding;
 pub mod http;
+pub mod metadata;
+pub mod normalizer;
+pub mod partitioner;
+pub mod path_confinement;
+pub mod processed_event;
+pub mod request_builder;
 pub mod retries;
-pub mod rusoto;
 pub mod service;
-pub mod tls;
+pub mod sink;
+pub mod snappy;
+pub mod socket_bytes_sink;
+pub mod statistic;
+pub mod tcp;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test;
+pub mod udp;
+#[cfg(unix)]
+pub mod unix;
+pub mod uri;
+pub mod zstd;
 
-use crate::buffers::Acker;
-use futures::{
-    future, stream::FuturesUnordered, Async, AsyncSink, Future, Poll, Sink, StartSend, Stream,
+use std::borrow::Cow;
+
+pub use batch::{
+    Batch, BatchConfig, BatchSettings, BatchSize, BulkSizeBasedDefaultBatchSettings, Merged,
+    NoDefaultsBatchSettings, PushResult, RealtimeEventBasedDefaultBatchSettings,
+    RealtimeSizeBasedDefaultBatchSettings, SinkBatchSettings, Unmerged,
 };
-use std::collections::HashMap;
-use std::hash::Hash;
-use tower::Service;
+pub use buffer::{
+    Buffer, Compression, PartitionBuffer, PartitionInnerBuffer,
+    json::{BoxedRawValue, JsonArrayBuffer},
+    partition::Partition,
+    vec::{EncodedLength, VecBuffer},
+};
+pub use builder::SinkBuilderExt;
+use chrono::{FixedOffset, Offset, Utc};
+pub use compressor::Compressor;
+pub use normalizer::Normalizer;
+pub use request_builder::{IncrementalRequestBuilder, RequestBuilder};
+pub use service::{
+    Concurrency, ServiceBuilderExt, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,
+    TowerRequestLayer, TowerRequestSettings,
+};
+pub use sink::{BatchSink, PartitionBatchSink, StreamSink};
+use snafu::Snafu;
+pub use uri::{HttpEndpoint, HttpEndpointError, UriSerde};
+use vector_lib::{TimeZone, json_size::JsonSize};
 
-pub use batch::{Batch, BatchConfig, BatchSettings, BatchSink};
-pub use buffer::metrics::MetricBuffer;
-pub use buffer::partition::{Partition, PartitionedBatchSink};
-pub use buffer::{Buffer, Compression, PartitionBuffer, PartitionInnerBuffer};
-pub use service::{ServiceBuilderExt, TowerRequestConfig, TowerRequestLayer, TowerRequestSettings};
+use crate::event::EventFinalizers;
 
-pub trait SinkExt<T>
-where
-    Self: Sink<SinkItem = T> + Sized,
-{
-    fn stream_ack(self, acker: Acker) -> StreamAck<Self> {
-        StreamAck::new(self, acker)
-    }
-
-    fn batched(self, batch: T, limit: usize) -> BatchSink<T, Self>
-    where
-        T: Batch,
-    {
-        BatchSink::new(self, batch, limit)
-    }
-
-    fn batched_with_min(self, batch: T, settings: &BatchSettings) -> BatchSink<T, Self>
-    where
-        T: Batch,
-    {
-        BatchSink::new_min(self, batch, settings.size, Some(settings.timeout))
-    }
-
-    fn partitioned_batched_with_min<K>(
-        self,
-        batch: T,
-        settings: &BatchSettings,
-    ) -> PartitionedBatchSink<T, Self, K>
-    where
-        T: Batch,
-        K: Eq + Hash + Clone + Send + 'static,
-    {
-        PartitionedBatchSink::with_linger(
-            self,
-            batch,
-            settings.size,
-            settings.size,
-            settings.timeout,
-        )
-    }
+#[derive(Debug, Snafu)]
+enum SinkBuildError {
+    #[snafu(display("Missing host in address field"))]
+    MissingHost,
+    #[snafu(display("Missing port in address field"))]
+    MissingPort,
 }
 
-impl<T, S> SinkExt<T> for S where S: Sink<SinkItem = T> + Sized {}
-
-pub struct StreamAck<T> {
-    inner: T,
-    acker: Acker,
-    pending: usize,
+#[derive(Debug)]
+pub struct EncodedEvent<I> {
+    pub item: I,
+    pub finalizers: EventFinalizers,
+    pub byte_size: usize,
+    pub json_byte_size: JsonSize,
 }
 
-impl<T: Sink> StreamAck<T> {
-    pub fn new(inner: T, acker: Acker) -> Self {
+impl<I> EncodedEvent<I> {
+    /// Create a trivial input with no metadata. This method will be
+    /// removed when all sinks are converted.
+    pub fn new(item: I, byte_size: usize, json_byte_size: JsonSize) -> Self {
         Self {
-            inner,
-            acker,
-            pending: 0,
+            item,
+            finalizers: EventFinalizers::default(),
+            byte_size,
+            json_byte_size,
         }
     }
-}
 
-impl<T: Sink> Sink for StreamAck<T> {
-    type SinkItem = T::SinkItem;
-    type SinkError = T::SinkError;
-
-    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        let res = self.inner.start_send(item);
-
-        if let Ok(AsyncSink::Ready) = res {
-            self.pending += 1;
-
-            if self.pending >= 10000 {
-                self.poll_complete()?;
-            }
-        }
-
-        res
-    }
-
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
-        let res = self.inner.poll_complete();
-
-        if let Ok(Async::Ready(_)) = res {
-            self.acker.ack(self.pending);
-            self.pending = 0;
-        }
-
-        res
-    }
-}
-
-pub type MetadataFuture<F, M> = future::Join<F, future::FutureResult<M, <F as Future>::Error>>;
-
-pub struct BatchServiceSink<T, S: Service<T>, B: Batch<Output = T>> {
-    service: S,
-    in_flight: FuturesUnordered<MetadataFuture<S::Future, (usize, usize)>>,
-    _phantom: std::marker::PhantomData<(T, B)>,
-
-    acker: Acker,
-    seq_head: usize,
-    seq_tail: usize,
-    pending_acks: HashMap<usize, usize>,
-}
-
-impl<T, S, B> BatchServiceSink<T, S, B>
-where
-    S: Service<T>,
-    B: Batch<Output = T>,
-{
-    pub fn new(service: S, acker: Acker) -> Self {
+    // This should be:
+    // ```impl<F, I: From<F>> From<EncodedEvent<F>> for EncodedEvent<I>```
+    // however, the compiler rejects that due to conflicting
+    // implementations of `From` due to the generic
+    // ```impl<T> From<T> for T```
+    pub fn from<F>(that: EncodedEvent<F>) -> Self
+    where
+        I: From<F>,
+    {
         Self {
-            service,
-            in_flight: FuturesUnordered::new(),
-            acker,
-            _phantom: std::marker::PhantomData,
-            seq_head: 0,
-            seq_tail: 0,
-            pending_acks: HashMap::new(),
+            item: I::from(that.item),
+            finalizers: that.finalizers,
+            byte_size: that.byte_size,
+            json_byte_size: that.json_byte_size,
+        }
+    }
+
+    /// Remap the item using an adapter
+    pub fn map<T>(self, doit: impl Fn(I) -> T) -> EncodedEvent<T> {
+        EncodedEvent {
+            item: doit(self.item),
+            finalizers: self.finalizers,
+            byte_size: self.byte_size,
+            json_byte_size: self.json_byte_size,
         }
     }
 }
 
-impl<T, S, B> Sink for BatchServiceSink<T, S, B>
-where
-    S: Service<T>,
-    S::Error: Into<crate::Error>,
-    S::Response: std::fmt::Debug,
-    B: Batch<Output = T>,
-{
-    type SinkItem = B;
-    type SinkError = ();
-
-    fn start_send(&mut self, batch: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        let mut tried_once = false;
-        loop {
-            match self.service.poll_ready() {
-                Ok(Async::Ready(())) => {
-                    let items_in_batch = batch.num_items();
-                    let seqno = self.seq_head;
-                    self.seq_head += 1;
-                    self.in_flight.push(
-                        self.service
-                            .call(batch.finish())
-                            .join(future::ok((seqno, items_in_batch))),
-                    );
-                    return Ok(AsyncSink::Ready);
-                }
-
-                Ok(Async::NotReady) => {
-                    if tried_once {
-                        return Ok(AsyncSink::NotReady(batch));
-                    } else {
-                        self.poll_complete()?;
-                        tried_once = true;
-                    }
-                }
-
-                // TODO: figure out if/how to handle this
-                Err(e) => panic!("service must be discarded: {}", e.into()),
-            }
-        }
-    }
-
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
-        loop {
-            match self.in_flight.poll() {
-                Ok(Async::NotReady) => return Ok(Async::NotReady),
-
-                Ok(Async::Ready(None)) => return Ok(Async::Ready(())),
-
-                Ok(Async::Ready(Some((response, (seqno, batch_size))))) => {
-                    self.pending_acks.insert(seqno, batch_size);
-
-                    let mut num_to_ack = 0;
-                    while let Some(ack_size) = self.pending_acks.remove(&self.seq_tail) {
-                        num_to_ack += ack_size;
-                        self.seq_tail += 1
-                    }
-                    self.acker.ack(num_to_ack);
-
-                    trace!(message = "request succeeded.", ?response);
-                }
-
-                Err(error) => {
-                    let error = error.into();
-                    error!(
-                        message = "request failed.",
-                        error = tracing::field::display(&error)
-                    )
-                }
-            }
-        }
+/// Joins namespace with name via delimiter if namespace is present.
+pub fn encode_namespace<'a>(
+    namespace: Option<&str>,
+    delimiter: char,
+    name: impl Into<Cow<'a, str>>,
+) -> String {
+    let name = name.into();
+    match namespace {
+        Some(namespace) => format!("{namespace}{delimiter}{name}"),
+        None => name.into_owned(),
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::BatchServiceSink;
-    use crate::buffers::Acker;
-    use crate::runtime::Runtime;
-    use crate::test_util::wait_for;
-    use futures::{stream, sync::oneshot, Future, Poll, Sink};
-    use std::sync::{atomic::Ordering, Arc, Mutex};
-    use tower::Service;
-
-    struct FakeService {
-        senders: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
-    }
-
-    impl FakeService {
-        fn new() -> (Self, Arc<Mutex<Vec<oneshot::Sender<()>>>>) {
-            let senders = Arc::new(Mutex::new(vec![]));
-
-            let res = Self {
-                senders: senders.clone(),
-            };
-
-            (res, senders)
+#[cfg(any(feature = "sinks-datadog_metrics", feature = "sinks-statsd"))]
+pub(crate) fn encode_metric_tag(output: &mut String, name: &str, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            output.reserve(name.len() + value.len() + 1);
+            output.push_str(name);
+            output.push(':');
+            output.push_str(value);
         }
+        None => output.push_str(name),
     }
+}
 
-    impl Service<Vec<()>> for FakeService {
-        type Response = ();
-        type Error = oneshot::Canceled;
-        type Future = oneshot::Receiver<()>;
+/// Marker trait for types that can hold a batch of events
+pub trait ElementCount {
+    fn element_count(&self) -> usize;
+}
 
-        fn poll_ready(&mut self) -> Poll<(), Self::Error> {
-            Ok(().into())
-        }
-
-        fn call(&mut self, _items: Vec<()>) -> Self::Future {
-            let (tx, rx) = oneshot::channel();
-            self.senders.lock().unwrap().push(tx);
-
-            rx
-        }
+impl<T> ElementCount for Vec<T> {
+    fn element_count(&self) -> usize {
+        self.len()
     }
+}
+
+#[must_use]
+pub fn timezone_to_offset(tz: TimeZone) -> Option<FixedOffset> {
+    match tz {
+        TimeZone::Local => Some(*Utc::now().with_timezone(&chrono::Local).offset()),
+        TimeZone::Named(tz) => Some(Utc::now().with_timezone(&tz).offset().fix()),
+    }
+}
+
+#[cfg(all(test, any(feature = "sinks-datadog_metrics", feature = "sinks-statsd")))]
+mod tests {
+    use super::encode_metric_tag;
 
     #[test]
-    fn batch_service_sink_acking() {
-        let mut rt = Runtime::new().unwrap();
+    fn encode_metric_tag_formats_valued_and_bare_tags() {
+        let mut output = String::new();
 
-        let (service, senders) = FakeService::new();
-        let (acker, ack_counter) = Acker::new_for_testing();
+        encode_metric_tag(&mut output, "name", Some("value"));
+        assert_eq!(output, "name:value");
 
-        let service_sink = BatchServiceSink::new(service, acker);
-
-        let b1 = vec![(); 1];
-        let b2 = vec![(); 2];
-        let b3 = vec![(); 4];
-        let b4 = vec![(); 8];
-        let b5 = vec![(); 16];
-        let b6 = vec![(); 32];
-
-        rt.spawn(
-            service_sink
-                .send_all(stream::iter_ok(vec![b1, b2, b3, b4, b5, b6]))
-                .map(|_| ()),
-        );
-
-        wait_for(|| senders.lock().unwrap().len() == 6);
-        assert_eq!(0, ack_counter.load(Ordering::Relaxed));
-
-        senders.lock().unwrap().remove(0).send(()).unwrap(); // 1
-        wait_for(|| {
-            let current = ack_counter.load(Ordering::Relaxed);
-            assert!(current == 0 || current == 1);
-            1 == current
-        });
-
-        senders.lock().unwrap().remove(1).send(()).unwrap(); // 4
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(1, ack_counter.load(Ordering::Relaxed));
-
-        senders.lock().unwrap().remove(0).send(()).unwrap(); // 2
-        wait_for(|| {
-            let current = ack_counter.load(Ordering::Relaxed);
-            assert!(current == 1 || current == 7);
-            7 == current
-        });
-
-        senders.lock().unwrap().remove(0).send(()).unwrap(); // 8
-        wait_for(|| {
-            let current = ack_counter.load(Ordering::Relaxed);
-            assert!(current == 7 || current == 15);
-            15 == current
-        });
-
-        senders.lock().unwrap().remove(1).send(()).unwrap(); // 32
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(15, ack_counter.load(Ordering::Relaxed));
-
-        drop(senders.lock().unwrap().remove(0)); // 16
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(15, ack_counter.load(Ordering::Relaxed));
+        output.clear();
+        encode_metric_tag(&mut output, "bare", None);
+        assert_eq!(output, "bare");
     }
 }

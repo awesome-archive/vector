@@ -1,0 +1,24 @@
+use std::sync::Arc;
+
+use http::Request;
+use vector_http::empty_body;
+
+use super::NewRelicCredentials;
+use crate::{http::HttpClient, sinks::HealthcheckError};
+
+pub(crate) async fn healthcheck(
+    client: HttpClient,
+    credentials: Arc<NewRelicCredentials>,
+) -> crate::Result<()> {
+    let request = Request::post(credentials.get_uri())
+        .header("Api-Key", credentials.license_key.clone())
+        .body(empty_body())
+        .expect("building healthcheck HTTP request failed unexpectedly");
+
+    let response = client.send(request).await?;
+
+    match response.status() {
+        status if status.is_success() => Ok(()),
+        other => Err(HealthcheckError::unexpected_status(other).into()),
+    }
+}

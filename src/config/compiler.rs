@@ -1,0 +1,329 @@
+use indexmap::{IndexMap, IndexSet};
+use std::sync::Arc;
+use vector_lib::config::ComponentKey;
+use vector_lib::id::Inputs;
+
+use super::{
+    Config, DynValidatedSink, OutputId, builder::ConfigBuilder, graph::Graph, graph_builder,
+    sink::SinkOuter, transform::get_transform_output_ids, validation,
+};
+
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::too_many_lines, reason = "Preserve existing control flow")]
+pub(super) fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<String>> {
+    let mut errors = Vec::new();
+
+    // component names should not have dots in the configuration file
+    // but components can expand (like route) to have components with a dot
+    // so this check should be done before expanding components
+    if let Err(name_errors) = validation::check_names(
+        builder
+            .transforms
+            .keys()
+            .chain(builder.sources.keys())
+            .chain(builder.sinks.keys()),
+    ) {
+        errors.extend(name_errors);
+    }
+
+    expand_globs(&mut builder);
+
+    if let Err(type_errors) = validation::check_shape(&builder) {
+        errors.extend(type_errors);
+    }
+
+    if let Err(type_errors) = validation::check_resources(&builder) {
+        errors.extend(type_errors);
+    }
+
+    if let Err(output_errors) = validation::check_outputs(&builder) {
+        errors.extend(output_errors);
+    }
+
+    if let Err(alpha_errors) = validation::check_values(&builder) {
+        errors.extend(alpha_errors);
+    }
+
+    let nodes = graph_builder::expanded_nodes(&builder);
+
+    let ConfigBuilder {
+        global,
+        #[cfg(feature = "api")]
+        api,
+        schema,
+        healthchecks,
+        enrichment_tables,
+        sources,
+        sinks,
+        transforms,
+        tests,
+        provider: _,
+        secret,
+        graceful_shutdown_duration,
+        allow_empty: _,
+        loading_warnings: mut warnings,
+    } = builder;
+    let graph = match Graph::new(nodes, global.wildcard_matching.unwrap_or_default()) {
+        Ok(graph) => graph,
+        Err(graph_errors) => {
+            errors.extend(graph_errors);
+            return Err(errors);
+        }
+    };
+
+    if let Err(input_errors) = graph.check_inputs() {
+        errors.extend(input_errors);
+        return Err(errors);
+    }
+
+    if let Err(type_errors) = graph.typecheck() {
+        errors.extend(type_errors);
+    }
+
+    if let Err(e) = graph.check_for_cycles() {
+        errors.push(e);
+    }
+
+    // Inputs are resolved from string into OutputIds as part of graph construction, so update them
+    // here before adding to the final config (the types require this).
+    let sinks: IndexMap<ComponentKey, SinkOuter<OutputId>> = sinks
+        .into_iter()
+        .map(|(key, sink)| {
+            let inputs = graph.inputs_for_component(&key);
+            (key, sink.with_inputs(inputs))
+        })
+        .collect();
+    let transforms = transforms
+        .into_iter()
+        .map(|(key, transform)| {
+            let inputs = graph.inputs_for_component(&key);
+            (key, transform.with_inputs(inputs))
+        })
+        .collect();
+    let enrichment_tables = enrichment_tables
+        .into_iter()
+        .map(|(key, table)| {
+            let inputs = graph.inputs_for_component(&key);
+            (key, table.with_inputs(inputs))
+        })
+        .collect();
+    let output_map = graph.output_map().expect("ambiguous outputs");
+    let tests = tests
+        .into_iter()
+        .map(|test| test.resolve_outputs(&output_map))
+        .collect::<Result<Vec<_>, Vec<_>>>()?;
+
+    if errors.is_empty() {
+        let mut config = Config {
+            #[cfg(feature = "api")]
+            api,
+            schema,
+            global,
+            healthchecks,
+            sources,
+            sinks,
+            transforms,
+            enrichment_tables,
+            tests,
+            secret,
+            graceful_shutdown_duration,
+        };
+
+        // Validate sinks in place
+        let validate_errors = validate_sinks(&mut config);
+        if !validate_errors.is_empty() {
+            errors.extend(validate_errors);
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        config.propagate_acknowledgements()?;
+
+        warnings.extend(validation::warnings(&config));
+
+        Ok((config, warnings))
+    } else {
+        Err(errors)
+    }
+}
+
+/// Expand globs in input lists
+pub(crate) fn expand_globs(config: &mut ConfigBuilder) {
+    let candidates = config
+        .sources
+        .iter()
+        .flat_map(|(key, s)| {
+            s.inner
+                .outputs(config.schema.log_namespace())
+                .into_iter()
+                .map(|output| OutputId {
+                    component: key.clone(),
+                    port: output.port,
+                })
+        })
+        .chain(config.transforms.iter().flat_map(|(key, t)| {
+            get_transform_output_ids(t.inner.as_ref(), key.clone(), config.schema.log_namespace())
+        }))
+        .map(|output_id| output_id.to_string())
+        .collect::<IndexSet<String>>();
+
+    for (id, transform) in &mut config.transforms {
+        expand_globs_inner(&mut transform.inputs, &id.to_string(), &candidates);
+    }
+
+    for (id, sink) in &mut config.sinks {
+        expand_globs_inner(&mut sink.inputs, &id.to_string(), &candidates);
+    }
+}
+
+/// Validate all sinks (direct and enrichment-table-derived) in place.
+///
+/// Fills the `validated` field on each sink's `SinkOuter` (and on enrichment tables that
+/// double as sinks) with the erased validated state. Returns a list of errors for sinks
+/// that failed validation. An empty Vec means success.
+fn validate_sinks(config: &mut Config) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    // Validate direct sinks
+    for (key, sink) in &mut config.sinks {
+        let dyn_sink: &dyn DynValidatedSink = sink.inner.as_ref();
+        match dyn_sink.validate_dyn() {
+            Ok(state) => sink.validated = Some(Arc::from(state)),
+            Err(e) => errors.push(format!("Failed to validate sink \"{key}\": {e}")),
+        }
+    }
+
+    // Validate enrichment table sinks with resolved inputs.
+    for (key, table) in &mut config.enrichment_tables {
+        if let Some((_, sink)) = table.as_sink(key) {
+            let dyn_sink: &dyn DynValidatedSink = sink.inner.as_ref();
+            match dyn_sink.validate_dyn() {
+                Ok(state) => table.validated = Some(Arc::from(state)),
+                Err(error) => errors.push(format!(
+                    "Failed to validate enrichment table sink \"{key}\": {error}"
+                )),
+            }
+        }
+    }
+
+    errors
+}
+
+enum InputMatcher {
+    Pattern(glob::Pattern),
+    String(String),
+}
+
+impl InputMatcher {
+    fn matches(&self, candidate: &str) -> bool {
+        use InputMatcher::{Pattern, String};
+
+        match self {
+            Pattern(pattern) => pattern.matches(candidate),
+            String(s) => s == candidate,
+        }
+    }
+}
+
+// https://github.com/vectordotdev/vector/issues/23659
+#[allow(clippy::similar_names, reason = "Naming cleanup deferred")]
+fn expand_globs_inner(inputs: &mut Inputs<String>, id: &str, candidates: &IndexSet<String>) {
+    let raw_inputs = std::mem::take(inputs);
+    for raw_input in raw_inputs {
+        let matcher = glob::Pattern::new(&raw_input).map_or_else(
+            |error| {
+                warn!(message = "Invalid glob pattern for input.", component_id = %id, %error);
+                InputMatcher::String(raw_input.clone())
+            },
+            InputMatcher::Pattern,
+        );
+        let mut matched = false;
+        for input in candidates {
+            if matcher.matches(input) && input != id {
+                matched = true;
+                inputs.extend(Some(input.clone()));
+            }
+        }
+        // If it didn't work as a glob pattern, leave it in the inputs as-is. This lets us give
+        // more accurate error messages about nonexistent inputs.
+        if !matched {
+            inputs.extend(Some(raw_input));
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use vector_lib::config::ComponentKey;
+
+    use super::*;
+    use crate::test_util::mock::{basic_sink, basic_source, basic_transform};
+
+    #[test]
+    fn glob_expansion() {
+        let mut builder = ConfigBuilder::default();
+        builder.add_source("foo1", basic_source().1);
+        builder.add_source("foo2", basic_source().1);
+        builder.add_source("bar", basic_source().1);
+        builder.add_transform("foos", &["foo*"], basic_transform("", 1.0));
+        builder.add_sink("baz", &["foos*", "b*"], basic_sink(1).1);
+        builder.add_sink("quix", &["*oo*"], basic_sink(1).1);
+        builder.add_sink("quux", &["*"], basic_sink(1).1);
+
+        let config = builder.build().expect("build should succeed");
+
+        assert_eq!(
+            config
+                .transforms
+                .get(&ComponentKey::from("foos"))
+                .map(|item| without_ports(item.inputs.clone()))
+                .unwrap(),
+            vec![ComponentKey::from("foo1"), ComponentKey::from("foo2")]
+        );
+        assert_eq!(
+            config
+                .sinks
+                .get(&ComponentKey::from("baz"))
+                .map(|item| without_ports(item.inputs.clone()))
+                .unwrap(),
+            vec![ComponentKey::from("foos"), ComponentKey::from("bar")]
+        );
+        assert_eq!(
+            config
+                .sinks
+                .get(&ComponentKey::from("quux"))
+                .map(|item| without_ports(item.inputs.clone()))
+                .unwrap(),
+            vec![
+                ComponentKey::from("foo1"),
+                ComponentKey::from("foo2"),
+                ComponentKey::from("bar"),
+                ComponentKey::from("foos")
+            ]
+        );
+        assert_eq!(
+            config
+                .sinks
+                .get(&ComponentKey::from("quix"))
+                .map(|item| without_ports(item.inputs.clone()))
+                .unwrap(),
+            vec![
+                ComponentKey::from("foo1"),
+                ComponentKey::from("foo2"),
+                ComponentKey::from("foos")
+            ]
+        );
+    }
+
+    fn without_ports(outputs: Inputs<OutputId>) -> Vec<ComponentKey> {
+        outputs
+            .into_iter()
+            .map(|output| {
+                assert!(output.port.is_none());
+                output.component
+            })
+            .collect()
+    }
+}

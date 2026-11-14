@@ -1,0 +1,554 @@
+//! Annotates events with namespace metadata.
+
+#![deny(missing_docs)]
+
+use k8s_openapi::{api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::ObjectMeta};
+use kube::runtime::reflector::{ObjectRef, store::Store};
+use vector_lib::{
+    config::{LegacyKey, LogNamespace},
+    configurable::configurable_component,
+    lookup::{
+        OwnedTargetPath,
+        lookup_v2::{OptionalTargetPath, ValuePath},
+        owned_value_path, path,
+    },
+};
+
+use super::Config;
+use crate::event::{Event, LogEvent};
+
+/// Configuration for how the events are enriched with Namespace metadata.
+#[configurable_component]
+#[derive(Clone, Debug)]
+#[serde(deny_unknown_fields, default)]
+pub(super) struct FieldsSpec {
+    /// Event field for the Namespace's labels.
+    ///
+    /// Set to `""` to suppress this key.
+    #[configurable(metadata(docs::examples = ".k8s.ns_labels"))]
+    #[configurable(metadata(docs::examples = "k8s.ns_labels"))]
+    #[configurable(metadata(docs::examples = ""))]
+    pub namespace_labels: OptionalTargetPath,
+
+    /// Event field for the Namespace's annotations.
+    ///
+    /// Set to `""` to suppress this key.
+    #[configurable(metadata(docs::examples = ".k8s.ns_annotations"))]
+    #[configurable(metadata(docs::examples = "k8s.ns_annotations"))]
+    #[configurable(metadata(docs::examples = ""))]
+    pub namespace_annotations: OptionalTargetPath,
+}
+
+impl Default for FieldsSpec {
+    fn default() -> Self {
+        Self {
+            namespace_labels: OwnedTargetPath::event(owned_value_path!(
+                "kubernetes",
+                "namespace_labels"
+            ))
+            .into(),
+            namespace_annotations: OwnedTargetPath::event(owned_value_path!(
+                "kubernetes",
+                "namespace_annotations"
+            ))
+            .into(),
+        }
+    }
+}
+
+/// Annotate the event with namespace metadata.
+pub(super) struct NamespaceMetadataAnnotator {
+    namespace_state_reader: Store<Namespace>,
+    fields_spec: FieldsSpec,
+    log_namespace: LogNamespace,
+}
+
+impl NamespaceMetadataAnnotator {
+    /// Create a new [`NamespaceMetadataAnnotator`].
+    pub(super) const fn new(
+        namespace_state_reader: Store<Namespace>,
+        fields_spec: FieldsSpec,
+        log_namespace: LogNamespace,
+    ) -> Self {
+        Self {
+            namespace_state_reader,
+            fields_spec,
+            log_namespace,
+        }
+    }
+}
+
+impl NamespaceMetadataAnnotator {
+    /// Annotates an event with the information from the [`Namespace::metadata`].
+    pub(super) fn annotate(&self, event: &mut Event, pod_namespace: &str) -> Option<()> {
+        let log = event.as_mut_log();
+        let obj = ObjectRef::<Namespace>::new(pod_namespace);
+        let resource = self.namespace_state_reader.get(&obj)?;
+        let namespace: &Namespace = resource.as_ref();
+
+        annotate_from_metadata(
+            log,
+            &self.fields_spec,
+            &namespace.metadata,
+            self.log_namespace,
+        );
+        Some(())
+    }
+}
+
+fn annotate_from_metadata(
+    log: &mut LogEvent,
+    fields_spec: &FieldsSpec,
+    metadata: &ObjectMeta,
+    log_namespace: LogNamespace,
+) {
+    if let Some(labels) = &metadata.labels {
+        let legacy_key_prefix = fields_spec.namespace_labels.path.as_ref().map(|k| &k.path);
+
+        for (key, value) in labels {
+            let key_path = path!(key);
+            let legacy_key = legacy_key_prefix
+                .map(|k| k.concat(key_path))
+                .map(LegacyKey::Overwrite);
+
+            log_namespace.insert_source_metadata(
+                Config::NAME,
+                log,
+                legacy_key,
+                path!("namespace_labels", key),
+                value.to_owned(),
+            );
+        }
+    }
+
+    if let Some(annotations) = &metadata.annotations {
+        let legacy_key_prefix = fields_spec
+            .namespace_annotations
+            .path
+            .as_ref()
+            .map(|k| &k.path);
+
+        for (key, value) in annotations {
+            let key_path = path!(key);
+            let legacy_key = legacy_key_prefix
+                .map(|k| k.concat(key_path))
+                .map(LegacyKey::Overwrite);
+
+            log_namespace.insert_source_metadata(
+                Config::NAME,
+                log,
+                legacy_key,
+                path!("namespace_annotations", key),
+                value.to_owned(),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use similar_asserts::assert_eq;
+    use vector_lib::lookup::{event_path, metadata_path};
+
+    use super::*;
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this fixture is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
+    #[test]
+    fn test_annotate_from_metadata() {
+        let cases = vec![
+            (
+                FieldsSpec::default(),
+                ObjectMeta::default(),
+                LogEvent::default(),
+                LogNamespace::Legacy,
+            ),
+            (
+                FieldsSpec::default(),
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    labels: Some(
+                        vec![
+                            ("sandbox0-label0".to_owned(), "val0".to_owned()),
+                            ("sandbox0-label1".to_owned(), "val1".to_owned()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    ..ObjectMeta::default()
+                },
+                {
+                    let mut log = LogEvent::default();
+                    log.insert(
+                        metadata_path!("kubernetes_logs", "namespace_labels", "sandbox0-label0"),
+                        "val0",
+                    );
+                    log.insert(
+                        metadata_path!("kubernetes_logs", "namespace_labels", "sandbox0-label1"),
+                        "val1",
+                    );
+                    log
+                },
+                LogNamespace::Vector,
+            ),
+            (
+                FieldsSpec::default(),
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    labels: Some(
+                        vec![
+                            ("sandbox0-label0".to_owned(), "val0".to_owned()),
+                            ("sandbox0-label1".to_owned(), "val1".to_owned()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    ..ObjectMeta::default()
+                },
+                {
+                    let mut log = LogEvent::default();
+                    log.insert(
+                        event_path!("kubernetes", "namespace_labels", "sandbox0-label0"),
+                        "val0",
+                    );
+                    log.insert(
+                        event_path!("kubernetes", "namespace_labels", "sandbox0-label1"),
+                        "val1",
+                    );
+                    log
+                },
+                LogNamespace::Legacy,
+            ),
+            (
+                FieldsSpec {
+                    namespace_labels: OwnedTargetPath::event(owned_value_path!("ns_labels")).into(),
+                    ..FieldsSpec::default()
+                },
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    labels: Some(
+                        vec![
+                            ("sandbox0-label0".to_owned(), "val0".to_owned()),
+                            ("sandbox0-label1".to_owned(), "val1".to_owned()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    ..ObjectMeta::default()
+                },
+                {
+                    let mut log = LogEvent::default();
+                    log.insert(event_path!("ns_labels", "sandbox0-label0"), "val0");
+                    log.insert(event_path!("ns_labels", "sandbox0-label1"), "val1");
+                    log
+                },
+                LogNamespace::Legacy,
+            ),
+            // Ensure we properly handle labels with `.` as flat fields.
+            (
+                FieldsSpec::default(),
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    labels: Some(
+                        vec![
+                            ("nested0.label0".to_owned(), "val0".to_owned()),
+                            ("nested0.label1".to_owned(), "val1".to_owned()),
+                            ("nested1.label0".to_owned(), "val2".to_owned()),
+                            ("nested2.label0.deep0".to_owned(), "val3".to_owned()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+
+                    ..ObjectMeta::default()
+                },
+                {
+                    let mut log = LogEvent::default();
+                    log.insert(
+                        metadata_path!("kubernetes_logs", "namespace_labels", "nested0.label0"),
+                        "val0",
+                    );
+                    log.insert(
+                        metadata_path!("kubernetes_logs", "namespace_labels", "nested0.label1"),
+                        "val1",
+                    );
+                    log.insert(
+                        metadata_path!("kubernetes_logs", "namespace_labels", "nested1.label0"),
+                        "val2",
+                    );
+                    log.insert(
+                        metadata_path!(
+                            "kubernetes_logs",
+                            "namespace_labels",
+                            "nested2.label0.deep0"
+                        ),
+                        "val3",
+                    );
+                    log
+                },
+                LogNamespace::Vector,
+            ),
+            (
+                FieldsSpec::default(),
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    labels: Some(
+                        vec![
+                            ("nested0.label0".to_owned(), "val0".to_owned()),
+                            ("nested0.label1".to_owned(), "val1".to_owned()),
+                            ("nested1.label0".to_owned(), "val2".to_owned()),
+                            ("nested2.label0.deep0".to_owned(), "val3".to_owned()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+
+                    ..ObjectMeta::default()
+                },
+                {
+                    let mut log = LogEvent::default();
+                    log.insert(
+                        event_path!("kubernetes", "namespace_labels", "nested0.label0"),
+                        "val0",
+                    );
+                    log.insert(
+                        event_path!("kubernetes", "namespace_labels", "nested0.label1"),
+                        "val1",
+                    );
+                    log.insert(
+                        event_path!("kubernetes", "namespace_labels", "nested1.label0"),
+                        "val2",
+                    );
+                    log.insert(
+                        event_path!("kubernetes", "namespace_labels", "nested2.label0.deep0"),
+                        "val3",
+                    );
+                    log
+                },
+                LogNamespace::Legacy,
+            ),
+            (
+                FieldsSpec::default(),
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    annotations: Some(
+                        vec![
+                            ("sandbox0-annotation0".to_owned(), "val0".to_owned()),
+                            ("sandbox0-annotation1".to_owned(), "val1".to_owned()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    ..ObjectMeta::default()
+                },
+                {
+                    let mut log = LogEvent::default();
+                    log.insert(
+                        metadata_path!(
+                            "kubernetes_logs",
+                            "namespace_annotations",
+                            "sandbox0-annotation0"
+                        ),
+                        "val0",
+                    );
+                    log.insert(
+                        metadata_path!(
+                            "kubernetes_logs",
+                            "namespace_annotations",
+                            "sandbox0-annotation1"
+                        ),
+                        "val1",
+                    );
+                    log
+                },
+                LogNamespace::Vector,
+            ),
+            (
+                FieldsSpec::default(),
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    annotations: Some(
+                        vec![
+                            ("sandbox0-annotation0".to_owned(), "val0".to_owned()),
+                            ("sandbox0-annotation1".to_owned(), "val1".to_owned()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    ..ObjectMeta::default()
+                },
+                {
+                    let mut log = LogEvent::default();
+                    log.insert(
+                        event_path!(
+                            "kubernetes",
+                            "namespace_annotations",
+                            "sandbox0-annotation0"
+                        ),
+                        "val0",
+                    );
+                    log.insert(
+                        event_path!(
+                            "kubernetes",
+                            "namespace_annotations",
+                            "sandbox0-annotation1"
+                        ),
+                        "val1",
+                    );
+                    log
+                },
+                LogNamespace::Legacy,
+            ),
+            (
+                FieldsSpec {
+                    namespace_annotations: OwnedTargetPath::event(owned_value_path!(
+                        "ns_annotations"
+                    ))
+                    .into(),
+                    ..FieldsSpec::default()
+                },
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    annotations: Some(
+                        vec![("sandbox0-annotation0".to_owned(), "val0".to_owned())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    ..ObjectMeta::default()
+                },
+                {
+                    let mut log = LogEvent::default();
+                    log.insert(
+                        event_path!("ns_annotations", "sandbox0-annotation0"),
+                        "val0",
+                    );
+                    log
+                },
+                LogNamespace::Legacy,
+            ),
+            // Labels and annotations are both extracted from the same Namespace.
+            (
+                FieldsSpec::default(),
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    labels: Some(
+                        vec![("sandbox0-label0".to_owned(), "val0".to_owned())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    annotations: Some(
+                        vec![("sandbox0-annotation0".to_owned(), "val1".to_owned())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    ..ObjectMeta::default()
+                },
+                {
+                    let mut log = LogEvent::default();
+                    log.insert(
+                        event_path!("kubernetes", "namespace_labels", "sandbox0-label0"),
+                        "val0",
+                    );
+                    log.insert(
+                        event_path!(
+                            "kubernetes",
+                            "namespace_annotations",
+                            "sandbox0-annotation0"
+                        ),
+                        "val1",
+                    );
+                    log
+                },
+                LogNamespace::Legacy,
+            ),
+            // Suppressing the legacy keys must not suppress the Vector namespace
+            // metadata, which is always stored under `%kubernetes_logs`.
+            (
+                FieldsSpec {
+                    namespace_labels: OptionalTargetPath::none(),
+                    namespace_annotations: OptionalTargetPath::none(),
+                },
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    labels: Some(
+                        vec![("sandbox0-label0".to_owned(), "val0".to_owned())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    annotations: Some(
+                        vec![("sandbox0-annotation0".to_owned(), "val1".to_owned())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    ..ObjectMeta::default()
+                },
+                {
+                    let mut log = LogEvent::default();
+                    log.insert(
+                        metadata_path!("kubernetes_logs", "namespace_labels", "sandbox0-label0"),
+                        "val0",
+                    );
+                    log.insert(
+                        metadata_path!(
+                            "kubernetes_logs",
+                            "namespace_annotations",
+                            "sandbox0-annotation0"
+                        ),
+                        "val1",
+                    );
+                    log
+                },
+                LogNamespace::Vector,
+            ),
+            // With the legacy namespace, an empty path does suppress the key.
+            (
+                FieldsSpec {
+                    namespace_annotations: OptionalTargetPath::none(),
+                    ..FieldsSpec::default()
+                },
+                ObjectMeta {
+                    name: Some("sandbox0-name".to_owned()),
+                    uid: Some("sandbox0-uid".to_owned()),
+                    labels: Some(
+                        vec![("sandbox0-label0".to_owned(), "val0".to_owned())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    annotations: Some(
+                        vec![("sandbox0-annotation0".to_owned(), "val1".to_owned())]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    ..ObjectMeta::default()
+                },
+                {
+                    let mut log = LogEvent::default();
+                    log.insert(
+                        event_path!("kubernetes", "namespace_labels", "sandbox0-label0"),
+                        "val0",
+                    );
+                    log
+                },
+                LogNamespace::Legacy,
+            ),
+        ];
+
+        for (fields_spec, metadata, expected, log_namespace) in cases {
+            let mut log = LogEvent::default();
+            annotate_from_metadata(&mut log, &fields_spec, &metadata, log_namespace);
+            assert_eq!(log, expected);
+        }
+    }
+}

@@ -1,0 +1,16 @@
+# STDIO Example
+# ------------------------------------------------------------------------------
+# A STDIN / STDOUT example. This configuration is used in the quickstart guide:
+#
+# https://vector.dev/docs/setup/quickstart
+
+sources:
+  in:
+    type: "stdin"
+
+sinks:
+  out:
+    inputs: ["in"]
+    type: "console"
+    encoding:
+      codec: "text"

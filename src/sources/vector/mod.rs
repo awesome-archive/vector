@@ -1,0 +1,717 @@
+//! The `vector` source. See [`VectorConfig`].
+use std::net::SocketAddr;
+use vector_lib::internal_event::{emit, register};
+
+use chrono::Utc;
+use futures::TryFutureExt;
+use tonic::{Request, Response, Status, service::RoutesBuilder};
+use tonic_health::server::health_reporter;
+use tower::layer::util::Identity;
+use vector_lib::{
+    EstimatedJsonEncodedSizeOf,
+    codecs::NativeDeserializerConfig,
+    config::LogNamespace,
+    configurable::configurable_component,
+    event::{BatchNotifier, BatchStatus, BatchStatusReceiver, Event},
+    internal_event::{CountByteSize, InternalEventHandle as _},
+};
+
+use crate::{
+    SourceSender,
+    config::{
+        DataType, GenerateConfig, Resource, SourceAcknowledgementsConfig, SourceConfig,
+        SourceContext, SourceOutput,
+    },
+    internal_events::{EventsReceived, GrpcEventDecodeError, StreamClosedError},
+    proto::vector as proto,
+    sources::{
+        Source,
+        util::{
+            decompression::max_decompressed_size_bytes,
+            grpc::{GrpcKeepaliveConfig, run_grpc_server_with_routes},
+        },
+    },
+    tls::{MaybeTlsSettings, TlsEnableableConfig},
+};
+
+/// Marker type for version two of the configuration for the `vector` source.
+#[configurable_component]
+#[derive(Clone, Debug)]
+enum VectorConfigVersion {
+    /// Marker value for version two.
+    #[serde(rename = "2")]
+    V2,
+}
+
+#[derive(Debug, Clone)]
+struct Service {
+    pipeline: SourceSender,
+    acknowledgements: bool,
+    log_namespace: LogNamespace,
+}
+
+#[tonic::async_trait]
+impl proto::Service for Service {
+    async fn push_events(
+        &self,
+        request: Request<proto::PushEventsRequest>,
+    ) -> Result<Response<proto::PushEventsResponse>, Status> {
+        let request = request.into_inner();
+        let mut events = Vec::with_capacity(request.events.len());
+        for wrapper in request.events {
+            match Event::try_from(wrapper) {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    emit(GrpcEventDecodeError { error: &error });
+                    return Err(Status::invalid_argument(error.to_string()));
+                }
+            }
+        }
+        if events.is_empty() {
+            return Ok(Response::new(proto::PushEventsResponse {}));
+        }
+
+        let now = Utc::now();
+        for event in &mut events {
+            if let Event::Log(log) = event {
+                self.log_namespace.insert_standard_vector_source_metadata(
+                    log,
+                    VectorConfig::NAME,
+                    now,
+                );
+            }
+        }
+
+        let count = events.len();
+        let byte_size = events.estimated_json_encoded_size_of();
+        let events_received = register(EventsReceived);
+        events_received.emit(CountByteSize(count, byte_size));
+
+        let receiver = BatchNotifier::maybe_apply_to(self.acknowledgements, &mut events);
+
+        self.pipeline
+            .clone()
+            .send_batch(events)
+            .map_err(|error| {
+                let message = error.to_string();
+                emit(StreamClosedError { count });
+                Status::unavailable(message)
+            })
+            .and_then(|()| handle_batch_status(receiver))
+            .await?;
+
+        Ok(Response::new(proto::PushEventsResponse {}))
+    }
+
+    // TODO: figure out a way to determine if the current Vector instance is "healthy".
+    async fn health_check(
+        &self,
+        _: Request<proto::HealthCheckRequest>,
+    ) -> Result<Response<proto::HealthCheckResponse>, Status> {
+        let message = proto::HealthCheckResponse {
+            status: proto::ServingStatus::Serving.into(),
+        };
+
+        Ok(Response::new(message))
+    }
+}
+
+async fn handle_batch_status(receiver: Option<BatchStatusReceiver>) -> Result<(), Status> {
+    let status = match receiver {
+        Some(receiver) => receiver.await,
+        None => BatchStatus::Delivered,
+    };
+
+    match status {
+        BatchStatus::Errored => Err(Status::internal("Delivery error")),
+        BatchStatus::Rejected => Err(Status::data_loss("Delivery failed")),
+        BatchStatus::Delivered => Ok(()),
+    }
+}
+
+/// Configuration for the `vector` source.
+#[configurable_component(source("vector", "Collect observability data from a Vector instance."))]
+#[derive(Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct VectorConfig {
+    /// Version of the configuration.
+    version: Option<VectorConfigVersion>,
+
+    /// The socket address to listen for connections on.
+    ///
+    /// It _must_ include a port.
+    pub address: SocketAddr,
+
+    #[serde(default)]
+    tls: Option<TlsEnableableConfig>,
+
+    #[serde(default, deserialize_with = "crate::serde::bool_or_struct")]
+    acknowledgements: SourceAcknowledgementsConfig,
+
+    #[serde(default)]
+    keepalive: GrpcKeepaliveConfig,
+
+    /// The namespace to use for logs. This overrides the global setting.
+    #[serde(default)]
+    #[configurable(metadata(docs::hidden))]
+    pub log_namespace: Option<bool>,
+}
+
+impl VectorConfig {
+    /// Creates a `VectorConfig` with the given address.
+    #[must_use]
+    pub fn from_address(addr: SocketAddr) -> Self {
+        Self {
+            address: addr,
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for VectorConfig {
+    fn default() -> Self {
+        Self {
+            version: None,
+            address: "0.0.0.0:6000".parse().unwrap(),
+            tls: None,
+            acknowledgements: SourceAcknowledgementsConfig::default(),
+            keepalive: GrpcKeepaliveConfig::default(),
+            log_namespace: None,
+        }
+    }
+}
+
+impl GenerateConfig for VectorConfig {
+    fn generate_config() -> serde_json::Value {
+        serde_json::to_value(VectorConfig::default()).unwrap()
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "vector")]
+impl SourceConfig for VectorConfig {
+    async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
+        let tls_settings = MaybeTlsSettings::from_config(self.tls.as_ref(), true)?;
+        let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
+        let log_namespace = cx.log_namespace(self.log_namespace);
+
+        // Create the custom Vector service (existing).
+        //
+        // Compression negotiation (gzip, zstd) is handled centrally by
+        // `DecompressionAndMetricsLayer` in `sources::util::grpc`, so we
+        // deliberately do not call `.accept_compressed(..)` here.
+        let vector_service = proto::Server::new(Service {
+            pipeline: cx.out,
+            acknowledgements,
+            log_namespace,
+        })
+        // Tonic added a default of 4MB in 0.9. Bound this by the global decompressed-size
+        // cap rather than `usize::MAX` so a single oversized message cannot drive unbounded
+        // allocation on this unauthenticated listener.
+        .max_decoding_message_size(max_decompressed_size_bytes());
+
+        // Create the standard gRPC health service
+        let (health_reporter, health_service) = health_reporter();
+
+        // Register the Vector service as serving in the health reporter
+        health_reporter
+            .set_service_status("vector.Vector", tonic_health::ServingStatus::Serving)
+            .await;
+
+        // Combine both services using RoutesBuilder
+        let mut builder = RoutesBuilder::default();
+        builder
+            .add_service(health_service)
+            .add_service(vector_service);
+
+        let source = run_grpc_server_with_routes(
+            self.address,
+            tls_settings,
+            None,
+            builder.routes(),
+            self.keepalive.clone(),
+            cx.shutdown,
+            Identity::new(),
+        )
+        .map_err(|error| {
+            error!(message = "Source future failed.", %error);
+            crate::sources::SourceError::from(error)
+        });
+
+        Ok(Box::pin(source))
+    }
+
+    fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
+        let log_namespace = global_log_namespace.merge(self.log_namespace);
+
+        let schema_definition = NativeDeserializerConfig
+            .schema_definition(log_namespace)
+            .with_standard_vector_source_metadata();
+
+        vec![SourceOutput::new_maybe_logs(
+            DataType::all_bits(),
+            schema_definition,
+        )]
+    }
+
+    fn resources(&self) -> Vec<Resource> {
+        vec![Resource::tcp(self.address)]
+    }
+
+    fn can_acknowledge(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use vector_lib::{config::LogNamespace, lookup::owned_value_path, schema::Definition};
+    use vrl::value::{Kind, kind::Collection};
+
+    use super::VectorConfig;
+    use crate::{
+        SourceSender,
+        config::{SourceConfig, SourceContext},
+        test_util,
+    };
+
+    #[test]
+    fn generate_config() {
+        crate::test_util::test_generate_config::<super::VectorConfig>();
+    }
+
+    #[test]
+    fn config_keepalive() {
+        let config: VectorConfig = toml::from_str(
+            r#"
+                address = "0.0.0.0:6000"
+
+                [keepalive]
+                max_connection_age_secs = 300
+                max_connection_age_grace_secs = 30
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.keepalive.max_connection_age_secs, Some(300));
+        assert_eq!(config.keepalive.max_connection_age_grace_secs, Some(30));
+    }
+
+    #[tokio::test]
+    async fn max_connection_age_closes_idle_connection() {
+        use tokio::{
+            io::AsyncReadExt,
+            net::TcpStream,
+            time::{Duration, sleep, timeout},
+        };
+
+        let (_guard, addr) = test_util::addr::next_addr();
+        let source_config = format!(
+            r#"
+                address = "{addr}"
+
+                [keepalive]
+                max_connection_age_secs = 1
+            "#
+        );
+        let source: VectorConfig = toml::from_str(&source_config).unwrap();
+
+        let (tx, _rx) = SourceSender::new_test();
+        let server = source
+            .build(SourceContext::new_test(tx, None))
+            .await
+            .unwrap();
+        tokio::spawn(server);
+        test_util::wait_for_tcp(addr).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        sleep(Duration::from_millis(1500)).await;
+
+        let mut buf = [0; 32];
+        let read = timeout(Duration::from_secs(2), async {
+            loop {
+                if stream.read(&mut buf).await.unwrap() == 0 {
+                    break 0;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(read, 0);
+    }
+
+    #[test]
+    fn output_schema_definition_vector_namespace() {
+        let config = VectorConfig::default();
+
+        let definitions = config
+            .outputs(LogNamespace::Vector)
+            .remove(0)
+            .schema_definition(true);
+
+        let expected_definition =
+            Definition::new_with_default_metadata(Kind::any(), [LogNamespace::Vector])
+                .with_metadata_field(
+                    &owned_value_path!("vector", "source_type"),
+                    Kind::bytes(),
+                    None,
+                )
+                .with_metadata_field(
+                    &owned_value_path!("vector", "ingest_timestamp"),
+                    Kind::timestamp(),
+                    None,
+                );
+
+        assert_eq!(definitions, Some(expected_definition));
+    }
+
+    #[test]
+    fn output_schema_definition_legacy_namespace() {
+        let config = VectorConfig::default();
+
+        let definitions = config
+            .outputs(LogNamespace::Legacy)
+            .remove(0)
+            .schema_definition(true);
+
+        let expected_definition = Definition::new_with_default_metadata(
+            Kind::object(Collection::empty()),
+            [LogNamespace::Legacy],
+        )
+        .with_event_field(&owned_value_path!("source_type"), Kind::bytes(), None)
+        .with_event_field(&owned_value_path!("timestamp"), Kind::timestamp(), None);
+
+        assert_eq!(definitions, Some(expected_definition));
+    }
+}
+
+#[cfg(feature = "sinks-vector")]
+#[cfg(test)]
+mod tests {
+    use vector_lib::{assert_event_data_eq, config::log_schema};
+
+    use super::*;
+    use crate::{
+        SourceSender,
+        config::{SinkConfig as _, SinkContext},
+        sinks::vector::VectorConfig as SinkConfig,
+        test_util,
+    };
+
+    async fn run_test(compression: Option<&str>) {
+        let (_guard, addr) = test_util::addr::next_addr();
+
+        let source_config = format!("address: \"{addr}\"");
+        let source: VectorConfig = serde_yaml::from_str(&source_config).unwrap();
+
+        let (tx, rx) = SourceSender::new_test();
+        let server = source
+            .build(SourceContext::new_test(tx, None))
+            .await
+            .unwrap();
+        tokio::spawn(server);
+        test_util::wait_for_tcp(addr).await;
+
+        // Ideally, this would be a fully custom agent to send the data,
+        // but the sink side already does such a test and this is good
+        // to ensure interoperability.
+        let sink_config = match compression {
+            Some(c) => indoc::formatdoc! {r#"
+                address: "http://{addr}"
+                compression: "{c}"
+            "#},
+            None => format!("address: \"http://{addr}\"\n"),
+        };
+        let sink: SinkConfig = serde_yaml::from_str(&sink_config).unwrap();
+        let cx = SinkContext::default();
+        let (sink, _) = sink.build(cx).await.unwrap();
+
+        let (mut events, stream) = test_util::random_events_with_stream(100, 100, None);
+        sink.run(stream).await.unwrap();
+
+        for event in &mut events {
+            event.as_mut_log().insert(
+                log_schema().source_type_key_target_path().unwrap(),
+                "vector",
+            );
+        }
+
+        let output = test_util::collect_ready(rx);
+        assert_event_data_eq!(events, output);
+    }
+
+    #[tokio::test]
+    async fn receive_message() {
+        run_test(None).await;
+    }
+
+    #[tokio::test]
+    async fn receive_gzip_compressed_message() {
+        run_test(Some("gzip")).await;
+    }
+
+    #[tokio::test]
+    async fn receive_zstd_compressed_message() {
+        run_test(Some("zstd")).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_deeply_nested_protobuf() {
+        use vector_lib::event::proto::{
+            EventWrapper, Log, Value, ValueArray, ValueMap, event_wrapper, value,
+        };
+
+        let (_guard, addr) = test_util::addr::next_addr();
+        let source: VectorConfig = serde_yaml::from_str(&format!("address: \"{addr}\"\n")).unwrap();
+        let (tx, rx) = SourceSender::new_test();
+        let server = tokio::spawn(
+            source
+                .build(SourceContext::new_test(tx, None))
+                .await
+                .unwrap(),
+        );
+        test_util::wait_for_tcp(addr).await;
+        let mut client = proto::Client::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+
+        let request = |depth| {
+            let mut nested = Value {
+                kind: Some(value::Kind::Integer(1)),
+            };
+            for _ in 0..depth {
+                nested = Value {
+                    kind: Some(value::Kind::Array(ValueArray {
+                        items: vec![nested],
+                    })),
+                };
+            }
+            proto::PushEventsRequest {
+                events: vec![EventWrapper {
+                    event: Some(event_wrapper::Event::Log(Log {
+                        value: Some(Value {
+                            kind: Some(value::Kind::Map(ValueMap {
+                                fields: [("nested".to_owned(), nested)].into(),
+                            })),
+                        }),
+                        ..Default::default()
+                    })),
+                }],
+            }
+        };
+
+        // Each array adds two Protobuf message levels. This exceeds Prost's depth
+        // budget while remaining well below the request-size limit.
+        let error = client.push_events(request(64)).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("recursion limit reached"));
+
+        client.push_events(request(1)).await.unwrap();
+        assert_eq!(test_util::collect_ready(rx).len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_health_check_works() {
+        use tonic::transport::Channel;
+
+        let (_guard, addr) = test_util::addr::next_addr();
+
+        let config = format!("address: \"{addr}\"");
+        let source: VectorConfig = serde_yaml::from_str(&config).unwrap();
+
+        let (tx, _rx) = SourceSender::new_test();
+        let server = source
+            .build(SourceContext::new_test(tx, None))
+            .await
+            .unwrap();
+        tokio::spawn(server);
+        test_util::wait_for_tcp(addr).await;
+
+        // Test the custom Vector health check endpoint
+        let endpoint = format!("http://{addr}");
+        let channel = Channel::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+
+        let mut client = proto::Client::new(channel);
+        let response = client
+            .health_check(proto::HealthCheckRequest {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.into_inner().status,
+            proto::ServingStatus::Serving as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn max_connection_age_allows_client_reconnect() {
+        use tokio::time::{Duration, sleep};
+        use tonic::transport::Channel;
+
+        use crate::sources::util::grpc::test_support::{
+            max_connection_age_connection_observations,
+            reset_max_connection_age_connection_observations,
+        };
+
+        let (_guard, addr) = test_util::addr::next_addr();
+
+        let config = format!(
+            r#"
+                address = "{addr}"
+
+                [keepalive]
+                max_connection_age_secs = 1
+            "#
+        );
+        let source: VectorConfig = toml::from_str(&config).unwrap();
+
+        reset_max_connection_age_connection_observations();
+
+        let (tx, _rx) = SourceSender::new_test();
+        let server = source
+            .build(SourceContext::new_test(tx, None))
+            .await
+            .unwrap();
+        tokio::spawn(server);
+        test_util::wait_for_tcp(addr).await;
+
+        let endpoint = format!("http://{addr}");
+        let channel = Channel::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = proto::Client::new(channel);
+
+        let response = client
+            .health_check(proto::HealthCheckRequest {})
+            .await
+            .unwrap();
+        assert_eq!(
+            response.into_inner().status,
+            proto::ServingStatus::Serving as i32
+        );
+        let observations_before_expiry = max_connection_age_connection_observations();
+        assert_ne!(observations_before_expiry, [] as [std::net::SocketAddr; 0]);
+
+        sleep(Duration::from_millis(1500)).await;
+
+        let response = client
+            .health_check(proto::HealthCheckRequest {})
+            .await
+            .unwrap();
+        assert_eq!(
+            response.into_inner().status,
+            proto::ServingStatus::Serving as i32
+        );
+        let observations = max_connection_age_connection_observations();
+        assert!(
+            observations.len() > observations_before_expiry.len(),
+            "expected second RPC to reconnect after max connection age elapsed, got observations: {observations:?}",
+        );
+        assert!(observations.iter().any(|peer_addr| {
+            !observations_before_expiry
+                .iter()
+                .any(|observed| observed == peer_addr)
+        }));
+    }
+
+    #[tokio::test]
+    async fn standard_grpc_health_check_works() {
+        use tonic_health::pb::health_check_response::ServingStatus;
+
+        use tonic::transport::Channel;
+        use tonic_health::pb::{HealthCheckRequest, health_client::HealthClient};
+
+        let (_guard, addr) = test_util::addr::next_addr();
+
+        let config = format!("address: \"{addr}\"");
+        let source: VectorConfig = serde_yaml::from_str(&config).unwrap();
+
+        let (tx, _rx) = SourceSender::new_test();
+        let server = source
+            .build(SourceContext::new_test(tx, None))
+            .await
+            .unwrap();
+        tokio::spawn(server);
+        test_util::wait_for_tcp(addr).await;
+
+        // Test the standard gRPC health check protocol
+        let endpoint = format!("http://{addr}");
+        let channel = Channel::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+
+        let mut client = HealthClient::new(channel);
+
+        // Check aggregate server health (empty service string)
+        let response = client
+            .check(HealthCheckRequest {
+                service: String::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.into_inner().status, ServingStatus::Serving as i32);
+
+        // Check the named Vector service health
+        let response = client
+            .check(HealthCheckRequest {
+                service: "vector.Vector".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.into_inner().status, ServingStatus::Serving as i32);
+    }
+
+    #[tokio::test]
+    async fn sink_reconnects_after_source_max_connection_age() {
+        use futures::StreamExt;
+        use tokio::time::{Duration, sleep};
+
+        let (_guard, addr) = test_util::addr::next_addr();
+        let source: VectorConfig = toml::from_str(&format!(
+            "address = \"{addr}\"\n[keepalive]\nmax_connection_age_secs = 1"
+        ))
+        .unwrap();
+        let (tx, _rx) = SourceSender::new_test();
+        let server = source
+            .build(SourceContext::new_test(tx, None))
+            .await
+            .unwrap();
+        tokio::spawn(server);
+        test_util::wait_for_tcp(addr).await;
+
+        // Retries are disabled, so the second batch must succeed on a new connection.
+        let sink: SinkConfig = toml::from_str(&format!(
+            "address = \"http://{addr}\"\nbatch.timeout_secs = 0.1\nrequest.retry_attempts = 0"
+        ))
+        .unwrap();
+        let (sink, _) = sink.build(SinkContext::default()).await.unwrap();
+
+        let (first_batch, first_receiver) = BatchNotifier::new_with_receiver();
+        let (_, first_stream) = test_util::random_events_with_stream(16, 5, Some(first_batch));
+        let (second_batch, second_receiver) = BatchNotifier::new_with_receiver();
+        let (_, second_stream) = test_util::random_events_with_stream(16, 5, Some(second_batch));
+        let wait_for_max_age = futures::stream::once(async move {
+            assert_eq!(first_receiver.await, BatchStatus::Delivered);
+            sleep(Duration::from_millis(1500)).await;
+        })
+        .filter_map(|()| std::future::ready(None));
+
+        sink.run(first_stream.chain(wait_for_max_age).chain(second_stream))
+            .await
+            .unwrap();
+
+        assert_eq!(second_receiver.await, BatchStatus::Delivered);
+    }
+}

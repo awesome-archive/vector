@@ -1,0 +1,78 @@
+//! The Vector Core Library
+//!
+//! The Vector Core Library are the foundational pieces needed to make a vector
+//! and is not vector with pieces missing. While this library is obviously
+//! tailored to the needs of vector it is written in such a way to make
+//! experimentation and testing _in the library_ cheap and demonstrative.
+//!
+//! This library was extracted from the top-level project package, discussed in
+//! RFC 7027.
+
+#![deny(warnings)]
+#![deny(clippy::all)]
+#![deny(unreachable_pub)]
+#![deny(unused_allocation)]
+#![deny(unused_extern_crates)]
+#![deny(unused_assignments)]
+#![deny(unused_comparisons)]
+#![allow(clippy::float_cmp)]
+#![allow(clippy::must_use_candidate)] // many false positives in this package
+
+pub mod config;
+pub mod event;
+pub mod fanout;
+pub mod ipallowlist;
+pub mod latency;
+pub mod metrics;
+pub mod partition;
+pub mod schema;
+pub mod serde;
+pub mod sink;
+pub mod source;
+pub mod source_sender;
+pub mod span_fields;
+pub mod tcp;
+#[cfg(test)]
+mod test_util;
+pub mod time;
+pub mod tls;
+pub mod transform;
+pub mod utilization;
+pub mod vrl;
+
+use std::path::PathBuf;
+
+pub use event::EstimatedJsonEncodedSizeOf;
+use float_eq::FloatEq;
+
+pub use crate::vrl::compile_vrl;
+
+#[macro_use]
+extern crate tracing;
+
+pub fn default_data_dir() -> Option<PathBuf> {
+    Some(PathBuf::from("/var/lib/vector/"))
+}
+
+pub(crate) use vector_common::{Error, Result};
+
+pub(crate) fn float_eq(l_value: f64, r_value: f64) -> bool {
+    (l_value.is_nan() && r_value.is_nan()) || l_value.eq_ulps(&r_value, &1)
+}
+
+/// Compares two optional floats, treating a reported value and an unreported one as different even
+/// when the reported value is zero.
+pub(crate) fn opt_float_eq(l_value: Option<f64>, r_value: Option<f64>) -> bool {
+    match (l_value, r_value) {
+        (Some(l_value), Some(r_value)) => float_eq(l_value, r_value),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+pub use span_fields::SpanField;
+
+// Re-export `inventory` so `register_extra_span_field!` can resolve `submit!` through this
+// crate without forcing downstream callers to declare `inventory` as a direct dependency.
+#[doc(hidden)]
+pub use inventory as __inventory;

@@ -1,111 +1,151 @@
 #[macro_use]
+extern crate criterion;
+#[macro_use]
 extern crate tracing;
 
-#[macro_use]
-extern crate criterion;
-
-use criterion::{black_box, Criterion};
 use std::{
     fmt,
+    hint::black_box,
     sync::{Mutex, MutexGuard},
 };
-use tracing::{field, span, Event, Id, Metadata};
-use tracing_limit::Limit;
-use tracing_subscriber::layer::SubscriberExt;
 
-const INPUTS: &'static [usize] = &[1, 100, 500, 1000];
+use criterion::{BenchmarkId, Criterion};
+use tracing::{Event, Metadata, Subscriber, field, span, subscriber::Interest};
+use tracing_limit::RateLimitedLayer;
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+const INPUTS: &[usize] = &[1, 100, 500, 1000];
 
 fn bench(c: &mut Criterion) {
-    c.bench_function_over_inputs(
-        "No Limit",
-        |b, n| {
-            let sub = VisitingSubscriber(Mutex::new(String::from("")));
-            let n = black_box(n);
-            tracing::subscriber::with_default(sub, || {
-                b.iter(|| {
-                    for _ in 0..**n {
-                        info!(
-                            message = "hello world",
-                            foo = "foo",
-                            bar = "bar",
-                            baz = 3,
-                            quuux = field::debug(0.99),
-                        )
-                    }
-                })
-            });
-        },
-        INPUTS,
-    );
+    let mut group = c.benchmark_group("tracing-limit");
+    for input in INPUTS {
+        group.bench_with_input(
+            BenchmarkId::new("none", input.to_string()),
+            input,
+            |b, n| {
+                let sub = tracing_subscriber::registry::Registry::default().with(
+                    RateLimitedLayer::new(VisitingLayer::new(Mutex::new(String::new()))),
+                );
+                let n = black_box(n);
+                tracing::subscriber::with_default(sub, || {
+                    b.iter(|| {
+                        for _ in 0..*n {
+                            info!(
+                                message = "Hello world!",
+                                foo = "foo",
+                                bar = "bar",
+                                baz = 3,
+                                quuux = ?0.99,
+                            );
+                        }
+                    });
+                });
+            },
+        );
+    }
 
-    c.bench_function_over_inputs(
-        "Limit 5 seconds",
-        |b, n| {
-            let sub = VisitingSubscriber(Mutex::new(String::from(""))).with(Limit::default());
+    for input in INPUTS {
+        group.bench_with_input(BenchmarkId::new("5s", input.to_string()), input, |b, n| {
+            let sub = tracing_subscriber::registry::Registry::default().with(
+                RateLimitedLayer::new(VisitingLayer::new(Mutex::new(String::new()))),
+            );
             let n = black_box(n);
             tracing::subscriber::with_default(sub, || {
                 b.iter(|| {
-                    for _ in 0..**n {
+                    for _ in 0..*n {
                         info!(
-                            message = "hello world",
+                            message = "Hello world!",
                             foo = "foo",
                             bar = "bar",
                             baz = 3,
-                            quuux = field::debug(0.99),
-                            rate_limit_secs = 5
-                        )
+                            quuux = ?0.99
+                        );
                     }
-                })
+                });
             });
-        },
-        INPUTS,
-    );
+        });
+    }
+    group.finish();
 }
 
-/// Simulates a subscriber that records span data.
-struct VisitingSubscriber(Mutex<String>);
+/// Simulates a layer that records span data.
+struct VisitingLayer<S>
+where
+    S: Subscriber,
+{
+    mutex: Mutex<String>,
+
+    _subscriber: std::marker::PhantomData<S>,
+}
+
+impl<S> VisitingLayer<S>
+where
+    S: Subscriber,
+{
+    fn new(mutex: Mutex<String>) -> Self {
+        VisitingLayer {
+            mutex,
+
+            _subscriber: std::marker::PhantomData,
+        }
+    }
+}
 
 struct Visitor<'a>(MutexGuard<'a, String>);
 
-impl<'a> field::Visit for Visitor<'a> {
+impl field::Visit for Visitor<'_> {
     fn record_debug(&mut self, _field: &field::Field, value: &dyn fmt::Debug) {
         use std::fmt::Write;
-        let _ = write!(&mut *self.0, "{:?}", value);
+        _ = write!(&mut *self.0, "{value:?}");
     }
 }
 
-impl tracing::Subscriber for VisitingSubscriber {
-    fn new_span(&self, span: &span::Attributes<'_>) -> Id {
-        let mut visitor = Visitor(self.0.lock().unwrap());
-        span.record(&mut visitor);
-        Id::from_u64(0xDEADFACE)
+impl<S> Layer<S> for VisitingLayer<S>
+where
+    S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+        Interest::always()
     }
 
-    fn record(&self, _span: &Id, values: &span::Record<'_>) {
-        let mut visitor = Visitor(self.0.lock().unwrap());
-        values.record(&mut visitor);
-    }
-
-    fn event(&self, event: &Event<'_>) {
-        let mut visitor = Visitor(self.0.lock().unwrap());
-        event.record(&mut visitor);
-    }
-
-    fn record_follows_from(&self, span: &Id, follows: &Id) {
-        let _ = (span, follows);
-    }
-
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        let _ = metadata;
+    fn enabled(&self, metadata: &Metadata<'_>, _ctx: Context<'_, S>) -> bool {
+        _ = metadata;
         true
     }
 
-    fn enter(&self, span: &Id) {
-        let _ = span;
+    fn on_new_span(&self, span: &span::Attributes<'_>, _id: &span::Id, _ctx: Context<'_, S>) {
+        let mut visitor = Visitor(self.mutex.lock().expect("mutex should not be poisoned"));
+        span.record(&mut visitor);
     }
 
-    fn exit(&self, span: &Id) {
-        let _ = span;
+    fn on_record(&self, _id: &span::Id, values: &span::Record<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = Visitor(self.mutex.lock().expect("mutex should not be poisoned"));
+        values.record(&mut visitor);
+    }
+
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = Visitor(self.mutex.lock().expect("mutex should not be poisoned"));
+        event.record(&mut visitor);
+    }
+
+    fn on_follows_from(&self, id: &span::Id, follows: &span::Id, _ctx: Context<'_, S>) {
+        _ = (id, follows);
+    }
+
+    fn on_enter(&self, id: &span::Id, _ctx: Context<'_, S>) {
+        _ = id;
+    }
+
+    fn on_exit(&self, id: &span::Id, _ctx: Context<'_, S>) {
+        _ = id;
+    }
+
+    fn on_close(&self, id: span::Id, _ctx: Context<'_, S>) {
+        _ = id;
+    }
+
+    fn on_id_change(&self, old: &span::Id, new: &span::Id, _ctx: Context<'_, S>) {
+        _ = (old, new);
     }
 }
 

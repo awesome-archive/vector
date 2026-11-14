@@ -1,83 +1,131 @@
-use super::batch::Batch;
-use flate2::write::GzEncoder;
-use partition::Partition;
-use serde::{Deserialize, Serialize};
 use std::io::Write;
 
+use bytes::{BufMut, BytesMut};
+use flate2::write::{GzEncoder, ZlibEncoder};
+
+use super::{
+    batch::{Batch, BatchSize, PushResult, err_event_too_large},
+    snappy::SnappyEncoder,
+    zstd::ZstdEncoder,
+};
+
+pub mod compression;
+pub mod json;
 pub mod metrics;
 pub mod partition;
+pub mod vec;
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
-#[serde(rename_all = "lowercase")]
-pub enum Compression {
-    None,
-    Gzip,
-}
+pub use compression::Compression;
+pub use partition::{Partition, PartitionBuffer, PartitionInnerBuffer};
 
 #[derive(Debug)]
 pub struct Buffer {
-    inner: InnerBuffer,
+    inner: Option<InnerBuffer>,
     num_items: usize,
+    num_bytes: usize,
+    settings: BatchSize<Self>,
+    compression: Compression,
 }
 
 #[derive(Debug)]
 pub enum InnerBuffer {
-    Plain(Vec<u8>),
-    Gzip(GzEncoder<Vec<u8>>),
+    Plain(bytes::buf::Writer<BytesMut>),
+    Gzip(GzEncoder<bytes::buf::Writer<BytesMut>>),
+    Zlib(ZlibEncoder<bytes::buf::Writer<BytesMut>>),
+    Zstd(ZstdEncoder<bytes::buf::Writer<BytesMut>>),
+    Snappy(SnappyEncoder<bytes::buf::Writer<BytesMut>>),
 }
 
 impl Buffer {
-    pub fn new(gzip: bool) -> Self {
-        let inner = if gzip {
-            InnerBuffer::Gzip(GzEncoder::new(Vec::new(), flate2::Compression::fast()))
-        } else {
-            InnerBuffer::Plain(Vec::new())
-        };
+    #[must_use]
+    pub const fn new(settings: BatchSize<Self>, compression: Compression) -> Self {
         Self {
-            inner,
+            inner: None,
             num_items: 0,
+            num_bytes: 0,
+            settings,
+            compression,
         }
     }
 
+    fn buffer(&mut self) -> &mut InnerBuffer {
+        let bytes = self.settings.bytes;
+        let compression = self.compression;
+        self.inner.get_or_insert_with(|| {
+            let writer = BytesMut::with_capacity(bytes).writer();
+            match compression {
+                Compression::None => InnerBuffer::Plain(writer),
+                Compression::Gzip(level) => {
+                    InnerBuffer::Gzip(GzEncoder::new(writer, level.as_flate2()))
+                }
+                Compression::Zlib(level) => {
+                    InnerBuffer::Zlib(ZlibEncoder::new(writer, level.as_flate2()))
+                }
+                Compression::Zstd(level) => InnerBuffer::Zstd(
+                    ZstdEncoder::new(writer, level.into())
+                        .expect("Zstd encoder should not fail on init."),
+                ),
+                Compression::Snappy => InnerBuffer::Snappy(SnappyEncoder::new(writer)),
+            }
+        })
+    }
+
+    /// Appends input to the buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if compression or writing to the buffer fails.
     pub fn push(&mut self, input: &[u8]) {
         self.num_items += 1;
-        match &mut self.inner {
+        match self.buffer() {
             InnerBuffer::Plain(inner) => {
-                inner.extend_from_slice(input);
+                inner.write_all(input).unwrap();
             }
             InnerBuffer::Gzip(inner) => {
                 inner.write_all(input).unwrap();
             }
+            InnerBuffer::Zlib(inner) => {
+                inner.write_all(input).unwrap();
+            }
+            InnerBuffer::Zstd(inner) => {
+                inner.write_all(input).unwrap();
+            }
+            InnerBuffer::Snappy(inner) => inner.write_all(input).unwrap(),
         }
     }
 
-    // This is not guaranteed to be completely accurate as the gzip library does
-    // some internal buffering.
-    pub fn size(&self) -> usize {
-        match &self.inner {
-            InnerBuffer::Plain(inner) => inner.len(),
-            InnerBuffer::Gzip(inner) => inner.get_ref().len(),
-        }
-    }
-
+    #[must_use]
     pub fn is_empty(&self) -> bool {
-        match &self.inner {
-            InnerBuffer::Plain(inner) => inner.is_empty(),
-            InnerBuffer::Gzip(inner) => inner.get_ref().is_empty(),
-        }
+        self.inner.as_ref().is_none_or(|inner| match inner {
+            InnerBuffer::Plain(inner) => inner.get_ref().is_empty(),
+            InnerBuffer::Gzip(inner) => inner.get_ref().get_ref().is_empty(),
+            InnerBuffer::Zlib(inner) => inner.get_ref().get_ref().is_empty(),
+            InnerBuffer::Zstd(inner) => inner.get_ref().get_ref().is_empty(),
+            InnerBuffer::Snappy(inner) => inner.is_empty(),
+        })
     }
 }
 
 impl Batch for Buffer {
-    type Input = Vec<u8>;
-    type Output = Vec<u8>;
+    type Input = BytesMut;
+    type Output = BytesMut;
 
-    fn len(&self) -> usize {
-        self.size()
-    }
-
-    fn push(&mut self, item: Self::Input) {
-        self.push(&item)
+    fn push(&mut self, item: Self::Input) -> PushResult<Self::Input> {
+        // The compressed encoders don't flush bytes immediately, so we
+        // can't track compressed sizes. Keep a running count of the
+        // number of bytes written instead.
+        let new_bytes = self.num_bytes + item.len();
+        if self.is_empty() && item.len() > self.settings.bytes {
+            err_event_too_large(item.len(), self.settings.bytes)
+        } else if self.num_items >= self.settings.events || new_bytes > self.settings.bytes {
+            PushResult::Overflow(item)
+        } else {
+            self.push(&item);
+            self.num_bytes = new_bytes;
+            PushResult::Ok(
+                self.num_items >= self.settings.events || new_bytes >= self.settings.bytes,
+            )
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -85,24 +133,29 @@ impl Batch for Buffer {
     }
 
     fn fresh(&self) -> Self {
-        let inner = match &self.inner {
-            InnerBuffer::Plain(_) => InnerBuffer::Plain(Vec::new()),
-            InnerBuffer::Gzip(_) => {
-                InnerBuffer::Gzip(GzEncoder::new(Vec::new(), flate2::Compression::default()))
-            }
-        };
-        Self {
-            inner,
-            num_items: 0,
-        }
+        Self::new(self.settings, self.compression)
     }
 
     fn finish(self) -> Self::Output {
         match self.inner {
-            InnerBuffer::Plain(inner) => inner,
-            InnerBuffer::Gzip(inner) => inner
+            Some(InnerBuffer::Plain(inner)) => inner.into_inner(),
+            Some(InnerBuffer::Gzip(inner)) => inner
                 .finish()
-                .expect("This can't fail because the inner writer is a Vec"),
+                .expect("This can't fail because the inner writer is a Vec")
+                .into_inner(),
+            Some(InnerBuffer::Zlib(inner)) => inner
+                .finish()
+                .expect("This can't fail because the inner writer is a Vec")
+                .into_inner(),
+            Some(InnerBuffer::Zstd(inner)) => inner
+                .finish()
+                .expect("This can't fail because the inner writer is a Vec")
+                .into_inner(),
+            Some(InnerBuffer::Snappy(inner)) => inner
+                .finish()
+                .expect("This can't fail because the inner writer is a Vec")
+                .into_inner(),
+            None => BytesMut::new(),
         }
     }
 
@@ -111,127 +164,75 @@ impl Batch for Buffer {
     }
 }
 
-#[derive(Debug)]
-pub struct PartitionBuffer<T, K> {
-    inner: T,
-    key: Option<K>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PartitionInnerBuffer<T, K> {
-    pub(self) inner: T,
-    key: K,
-}
-
-impl<T, K> PartitionBuffer<T, K> {
-    pub fn new(inner: T) -> Self {
-        Self { inner, key: None }
-    }
-}
-
-impl<T, K> Batch for PartitionBuffer<T, K>
-where
-    T: Batch,
-    K: Clone,
-{
-    type Input = PartitionInnerBuffer<T::Input, K>;
-    type Output = PartitionInnerBuffer<T::Output, K>;
-
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    fn push(&mut self, item: Self::Input) {
-        let partition = item.partition();
-        self.key = Some(partition);
-        self.inner.push(item.inner)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    fn fresh(&self) -> Self {
-        Self {
-            inner: self.inner.fresh(),
-            key: None,
-        }
-    }
-
-    fn finish(mut self) -> Self::Output {
-        let key = self.key.take().unwrap();
-        let inner = self.inner.finish();
-        PartitionInnerBuffer { inner, key }
-    }
-
-    fn num_items(&self) -> usize {
-        self.inner.num_items()
-    }
-}
-
-impl<T, K> PartitionInnerBuffer<T, K> {
-    pub fn new(inner: T, key: K) -> Self {
-        Self { inner, key }
-    }
-
-    pub fn into_parts(self) -> (T, K) {
-        (self.inner, self.key)
-    }
-}
-
-impl<T, K> Partition<K> for PartitionInnerBuffer<T, K>
-where
-    K: Clone,
-{
-    fn partition(&self) -> K {
-        self.key.clone()
-    }
-}
-
 #[cfg(test)]
 mod test {
-    use super::Buffer;
-    use crate::sinks::util::batch::{Batch, BatchSink};
-    use futures::{Future, Sink};
-    use std::io::Read;
+    use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn gzip() {
-        use flate2::read::GzDecoder;
+    use bytes::{Buf, BytesMut};
+    use futures::{SinkExt, StreamExt, future, stream};
+    use tokio::time::Duration;
+    use vector_lib::json_size::JsonSize;
 
-        let buffered = BatchSink::new(vec![], Buffer::new(true), 1000);
+    use super::{Buffer, Compression};
+    use crate::sinks::util::{BatchSettings, BatchSink, EncodedEvent};
 
-        let input = std::iter::repeat(
-            b"It's going down, I'm yelling timber, You better move, you better dance".to_vec(),
-        )
-        .take(100_000);
+    #[tokio::test]
+    async fn gzip() {
+        use vector_common::decompression::CappedDecoder;
 
-        let (buffered, _) = buffered
-            .send_all(futures::stream::iter_ok(input))
-            .wait()
-            .unwrap();
+        let sent_requests = Arc::new(Mutex::new(Vec::new()));
 
-        let output = buffered
-            .into_inner()
-            .into_iter()
-            .map(|buf| buf.finish())
-            .collect::<Vec<Vec<u8>>>();
-
-        assert!(output.len() > 1);
-        assert!(dbg!(output.iter().map(|o| o.len()).sum::<usize>()) < 51_000);
-
-        let decompressed = output.into_iter().flat_map(|batch| {
-            let mut decompressed = vec![];
-            GzDecoder::new(batch.as_slice())
-                .read_to_end(&mut decompressed)
-                .unwrap();
-            decompressed
+        let svc = tower::service_fn(|req| {
+            let sent_requests = Arc::clone(&sent_requests);
+            sent_requests.lock().unwrap().push(req);
+            future::ok::<_, std::io::Error>(())
         });
 
-        assert!(decompressed.eq(std::iter::repeat(
-            b"It's going down, I'm yelling timber, You better move, you better dance".to_vec()
-        )
-        .take(100_000)
-        .flatten()));
+        let mut batch_settings = BatchSettings::default();
+        batch_settings.size.bytes = 100_000;
+        batch_settings.size.events = 1_000;
+        batch_settings.timeout = Duration::from_secs(0);
+
+        let buffered = BatchSink::new(
+            svc,
+            Buffer::new(batch_settings.size, Compression::gzip_default()),
+            batch_settings.timeout,
+        );
+
+        let input = std::iter::repeat_n(
+            BytesMut::from(
+                "It's going down, I'm yelling timber, You better move, you better dance",
+            ),
+            100_000,
+        );
+
+        buffered
+            .sink_map_err(drop)
+            .send_all(
+                &mut stream::iter(input)
+                    .map(|item| Ok(EncodedEvent::new(item, 0, JsonSize::zero()))),
+            )
+            .await
+            .unwrap();
+
+        let output = Arc::try_unwrap(sent_requests)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+
+        assert!(output.len() > 1);
+        assert!(output.iter().map(BytesMut::len).sum::<usize>() < 80_000);
+
+        let decompressed = output
+            .into_iter()
+            .flat_map(|batch| CappedDecoder::gzip(batch.reader()).decompress().unwrap());
+
+        assert!(
+            decompressed.eq(std::iter::repeat_n(
+                b"It's going down, I'm yelling timber, You better move, you better dance".to_vec(),
+                100_000
+            )
+            .flatten())
+        );
     }
 }

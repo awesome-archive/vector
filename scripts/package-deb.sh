@@ -1,57 +1,97 @@
 #!/usr/bin/env bash
+set -euo pipefail
+set -x
 
 # package-deb.sh
 #
 # SUMMARY
 #
 #   Packages a .deb file to be distributed in the APT package manager.
+#
+# ENV VARS
+#
+#   $TARGET         a target triple. ex: arm64-apple-darwin (no default)
 
-set -eu
+TARGET="${TARGET:?"You must specify a target triple, ex: arm64-apple-darwin"}"
+PROFILE="${PROFILE:-release}"
 
-project_root=$(pwd)
-archive_name="vector-$TARGET.tar.gz"
-archive_path="target/artifacts/$archive_name"
-absolute_archive_path="$project_root/$archive_path"
-package_version="$($project_root/scripts/version.sh)"
-echo "Packaging .deb for $archive_name"
+#
+# Local vars
+#
 
-# Rename the rust-toolchain file so that we can use our custom version of rustc installed
-# on release containers.
-on_exit="mv rust-toolchain.bak rust-toolchain"
-trap "$on_exit" EXIT
-mv rust-toolchain rust-toolchain.bak
+PROJECT_ROOT="$(pwd)"
+PACKAGE_VERSION="${VECTOR_VERSION:-"$(${VDEV:-cargo vdev} version)"}"
+ARCHIVE_NAME="vector-${PACKAGE_VERSION}-$TARGET.tar.gz"
+ARCHIVE_PATH="target/artifacts/$ARCHIVE_NAME"
+ABSOLUTE_ARCHIVE_PATH="$PROJECT_ROOT/$ARCHIVE_PATH"
+
+#
+# Header
+#
+
+echo "Packaging .deb for $ARCHIVE_NAME"
+echo "TARGET: $TARGET"
+
+#
+# Unarchive
+#
 
 # Unarchive the tar since cargo deb wants direct access to the files.
-td=$(mktemp -d)
-pushd $td
-tar -xvf $absolute_archive_path
-mkdir -p $project_root/target/$TARGET/release
-mv vector-$TARGET/bin/vector $project_root/target/$TARGET/release
+td="$(mktemp -d)"
+pushd "$td"
+tar -xvf "$ABSOLUTE_ARCHIVE_PATH"
+mkdir -p "$PROJECT_ROOT/target/$TARGET/$PROFILE"
+mv "vector-$TARGET/bin/vector" "$PROJECT_ROOT/target/$TARGET/$PROFILE"
 popd
-rm -rf $td
+rm -rf "$td"
+
+# Display disk space
+df -h
+
+#
+# Package
+#
 
 # Create short plain-text extended description for the package
-cmark-gfm $project_root/README.md --to commonmark | # expand link aliases
-  sed '/^## /Q' | # select text before first header
-  cmark-gfm --to plaintext | # convert to plain text
-  fmt -uw 80 > $project_root/target/debian-extended-description.txt
+EXPANDED_LINK_ALIASED="$(cmark-gfm "$PROJECT_ROOT/README.md" --to commonmark)" # expand link aliases
+TEXT_BEFORE_FIRST_HEADER="$(sed '/^## /Q' <<<"$EXPANDED_LINK_ALIASED")"        # select text before first header
+PLAIN_TEXT="$(cmark-gfm --to plaintext <<<"$TEXT_BEFORE_FIRST_HEADER")"        # convert to plain text
+FORMATTED="$(fmt -uw 80 <<<"$PLAIN_TEXT")"
+cat <<<"$FORMATTED" >"$PROJECT_ROOT/target/debian-extended-description.txt"
 
 # Create the license file for binary distributions (LICENSE + NOTICE)
-cat LICENSE NOTICE > $project_root/target/debian-license.txt
+cat LICENSE NOTICE >"$PROJECT_ROOT/target/debian-license.txt"
 
+#
 # Build the deb
 #
 #   --target
-#     tells the builder everything it needs to know aboout where
+#     tells the builder everything it needs to know about where
 #     the deb can run, including the architecture
 #
 #   --no-build
-#     because this stop should follow a build
-cargo deb --target $TARGET --deb-version $package_version --no-build
+#     because this step should follow a build
 
-# Rename the resulting .deb file to use - instead of _ since this
-# is consistent with our package naming scheme.
-rename -v 's/vector_([^_]*)_(.*)\.deb/vector-$2\.deb/' target/$TARGET/debian/*.deb
+# Debian uses `~` to order prereleases before the corresponding stable version,
+# mirroring `scripts/package-rpm.sh`. Without this, a `0.59.0-dev-1` package
+# would sort newer than the eventual stable `0.59.0-1` release.
+DEB_VERSION="${PACKAGE_VERSION/-/\~}"
+${VDEV:-cargo vdev} build debian-maintainer-scripts
 
+cargo deb --target "$TARGET" --deb-version "${DEB_VERSION}-1" --variant "$TARGET" --no-build --no-strip --profile "$PROFILE"
+
+# Rename the resulting .deb file to remove TARGET from name.
+for file in target/"${TARGET}"/debian/*.deb; do
+  base=$(basename "${file}")
+  nbase=${base//-${TARGET}/}
+  # the file won't have TARGET in its name if not a "variant"
+  if [[ "${file}" != target/"${TARGET}"/debian/"${nbase}" ]]; then
+    mv "${file}" target/"${TARGET}"/debian/"${nbase}"
+  fi
+done
+
+#
 # Move the deb into the artifacts dir
-mv -v $(find target/$TARGET/debian/ -name *.deb) target/artifacts
+#
+
+mv -v "target/$TARGET/debian"/*.deb target/artifacts

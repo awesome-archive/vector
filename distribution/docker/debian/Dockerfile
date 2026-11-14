@@ -1,14 +1,30 @@
-FROM debian:buster-slim AS builder
+FROM docker.io/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS builder
 
-COPY vector-*.deb ./
-RUN dpkg -i vector-$(dpkg --print-architecture).deb
+WORKDIR /vector
 
-FROM debian:buster-slim
+COPY vector_*.deb ./
+RUN dpkg -i vector_*_"$(dpkg --print-architecture)".deb
 
-RUN apt-get update && apt-get install -y ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /var/lib/vector
+
+FROM docker.io/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+
+# https://github.com/opencontainers/image-spec/blob/main/annotations.md
+LABEL org.opencontainers.image.url="https://vector.dev"
+LABEL org.opencontainers.image.source="https://github.com/vectordotdev/vector"
+LABEL org.opencontainers.image.documentation="https://vector.dev/docs"
+
+# we want the latest versions of these
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata systemd libsasl2-2 && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/bin/vector /usr/bin/vector
+COPY --from=builder /usr/share/vector /usr/share/vector
 COPY --from=builder /usr/share/doc/vector /usr/share/doc/vector
 COPY --from=builder /etc/vector /etc/vector
+COPY --from=builder /var/lib/vector /var/lib/vector
+
+# Smoke test
+RUN ["vector", "--version"]
 
 ENTRYPOINT ["/usr/bin/vector"]

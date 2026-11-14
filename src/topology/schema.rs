@@ -1,0 +1,1051 @@
+use std::collections::HashMap;
+
+use snafu::Snafu;
+use vector_lib::{config::SourceOutput, enrichment::TableRegistry};
+
+pub(super) use crate::schema::Definition;
+use crate::{
+    config::{ComponentKey, Config, OutputId, SinkOuter, TransformContext, TransformOutput},
+    topology,
+};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    ContainsNever,
+}
+
+/// The cache is used whilst building up the topology.
+/// The key includes whether schema tracking is enabled and the ordered inputs.
+type Cache = HashMap<(bool, Vec<OutputId>), Vec<(OutputId, Definition)>>;
+
+/// Returns the possible schema definitions for the given inputs.
+///
+/// # Errors
+///
+/// Returns an error if an input schema contains the never type.
+///
+/// # Panics
+///
+/// Panics if a referenced component or output port is missing from the topology.
+pub fn possible_definitions(
+    inputs: &[OutputId],
+    config: &dyn ComponentContainer,
+    enrichment_tables: &TableRegistry,
+    cache: &mut Cache,
+) -> Result<Vec<(OutputId, Definition)>, Error> {
+    if inputs.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Try to get the definition from the cache.
+    if let Some(definition) = cache.get(&(config.schema_enabled(), inputs.to_vec())) {
+        return Ok(definition.clone());
+    }
+
+    let mut definitions = Vec::new();
+
+    for input in inputs {
+        let key = &input.component;
+
+        // If the input is a source, the output is merged into the top-level schema.
+        if let Ok(maybe_output) = config.source_output_for_port(key, &input.port) {
+            let mut source_definition = input.with_definitions(
+                maybe_output
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "source output misconfigured - output for port {:?} missing",
+                            &input.port
+                        )
+                    })
+                    .schema_definition(config.schema_enabled()),
+            );
+
+            if contains_never(&source_definition) {
+                return Err(Error::ContainsNever);
+            }
+
+            definitions.append(&mut source_definition);
+        }
+
+        // If the input is a transform, the output is merged into the top-level schema
+        if let Some(inputs) = config.transform_inputs(key) {
+            let input_definitions = possible_definitions(inputs, config, enrichment_tables, cache)?;
+
+            let mut transform_definition = input.with_definitions(
+                config
+                    .transform_output_for_port(
+                        key,
+                        &input.port,
+                        enrichment_tables.clone(),
+                        &input_definitions,
+                    )
+                    .expect("transform must exist - already found inputs")
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "transform output misconfigured - output for port {:?} missing",
+                            &input.port
+                        )
+                    })
+                    .schema_definitions(config.schema_enabled())
+                    .values()
+                    .cloned(),
+            );
+
+            if contains_never(&transform_definition) {
+                return Err(Error::ContainsNever);
+            }
+
+            definitions.append(&mut transform_definition);
+        }
+    }
+
+    cache.insert(
+        (config.schema_enabled(), inputs.to_vec()),
+        definitions.clone(),
+    );
+
+    Ok(definitions)
+}
+
+/// Get a list of definitions from individual pipelines feeding into a component.
+///
+/// For example, given the following topology:
+///
+///   Source 1 -> Transform 1                ->
+///   Source 2 -> Transform 2                ->
+///            -> Transform 3 ->
+///            -> Transform 4 -> Transform 5 -> Sink 1
+///
+/// In this example, if we ask for the definitions received by `Sink 1`, we'd receive four
+/// definitions, one for each route leading into `Sink 1`, with the route going through `Transform
+/// 5` being expanded into two individual routes (So1 -> T3 -> T5 -> Si1 AND So1 -> T4 -> T5 ->
+/// Si1).
+pub(super) fn expanded_definitions(
+    enrichment_tables: &TableRegistry,
+    inputs: &[OutputId],
+    config: &dyn ComponentContainer,
+    cache: &mut Cache,
+) -> Result<Vec<(OutputId, Definition)>, Error> {
+    // Try to get the definition from the cache.
+    if let Some(definitions) = cache.get(&(config.schema_enabled(), inputs.to_vec())) {
+        return Ok(definitions.clone());
+    }
+
+    let mut definitions: Vec<(OutputId, Definition)> = vec![];
+    let mut merged_cache = HashMap::default();
+
+    for input in inputs {
+        let key = &input.component;
+
+        // If the input is a source, it'll always have schema definition attached, even if it is an
+        // "empty" schema.
+        // We take the full schema definition regardless of `config.schema_enabled()`, the assumption
+        // being that the receiving component will not be validating the schema if schema checking is
+        // not enabled.
+        if let Some(outputs) = config.source_outputs(key) {
+            // After getting the source matching to the given input, we need to further narrow the
+            // actual output of the source feeding into this input, and then get the definition
+            // belonging to that output.
+            let mut source_definitions =
+                outputs
+                    .into_iter()
+                    .find_map(|output| {
+                        if output.port == input.port {
+                            Some(input.with_definitions(
+                                output.schema_definition(config.schema_enabled()),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        // If we find no match, it means the topology is misconfigured. This is a fatal
+                        // error, but other parts of the topology builder deal with this state.
+                        unreachable!("source output misconfigured")
+                    });
+
+            if contains_never(&source_definitions) {
+                return Err(Error::ContainsNever);
+            }
+
+            definitions.append(&mut source_definitions);
+
+        // A transform can receive from multiple inputs, and each input needs to be expanded to
+        // a new pipeline.
+        } else if let Some(inputs) = config.transform_inputs(key) {
+            let input_definitions =
+                possible_definitions(inputs, config, enrichment_tables, &mut merged_cache)?;
+
+            let mut transform_definition = config
+                .transform_outputs(key, enrichment_tables.clone(), &input_definitions)
+                .expect("already found inputs")
+                .iter()
+                .find_map(|output| {
+                    if output.port == input.port {
+                        Some(
+                            input.with_definitions(
+                                output
+                                    .schema_definitions(config.schema_enabled())
+                                    .values()
+                                    .cloned(),
+                            ),
+                        )
+                    } else {
+                        None
+                    }
+                })
+                // If we find no match, it means the topology is misconfigured. This is a fatal
+                // error, but other parts of the topology builder deal with this state.
+                .expect("transform output misconfigured");
+
+            if contains_never(&transform_definition) {
+                return Err(Error::ContainsNever);
+            }
+
+            // Append whatever number of additional pipelines we created to the existing
+            // pipeline definitions.
+            definitions.append(&mut transform_definition);
+        }
+    }
+
+    cache.insert(
+        (config.schema_enabled(), inputs.to_vec()),
+        definitions.clone(),
+    );
+
+    Ok(definitions)
+}
+
+/// Returns a list of definitions from the given inputs.
+/// Errors if any of the definitions are [`Kind::never`] implying that
+/// an error condition has been reached.
+pub(crate) fn input_definitions(
+    inputs: &[OutputId],
+    config: &Config,
+    enrichment_tables: &TableRegistry,
+    cache: &mut Cache,
+) -> Result<Vec<(OutputId, Definition)>, Error> {
+    if inputs.is_empty() {
+        return Ok(vec![]);
+    }
+
+    if let Some(definitions) = cache.get(&(config.schema_enabled(), inputs.to_vec())) {
+        return Ok(definitions.clone());
+    }
+
+    let mut definitions = Vec::new();
+
+    for input in inputs {
+        let key = &input.component;
+
+        // If the input is a source we retrieve the definitions from the source
+        // (there should only be one) and add it to the return.
+        if let Ok(maybe_output) = config.source_output_for_port(key, &input.port) {
+            let mut source_definitions = input.with_definitions(
+                maybe_output
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "source output misconfigured - output for port {:?} missing",
+                            &input.port
+                        )
+                    })
+                    .schema_definition(config.schema_enabled()),
+            );
+
+            if contains_never(&source_definitions) {
+                return Err(Error::ContainsNever);
+            }
+
+            definitions.append(&mut source_definitions);
+        }
+
+        // If the input is a transform we recurse to the upstream components to retrieve
+        // their definitions and pass it through the transform to get the new definitions.
+        if let Some(inputs) = config.transform_inputs(key) {
+            let transform_definitions =
+                input_definitions(inputs, config, enrichment_tables, cache)?;
+
+            if contains_never(&transform_definitions) {
+                return Err(Error::ContainsNever);
+            }
+
+            let mut transform_definitions = input.with_definitions(
+                config
+                    .transform_output_for_port(
+                        key,
+                        &input.port,
+                        enrichment_tables.clone(),
+                        &transform_definitions,
+                    )
+                    .expect("transform must exist")
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "transform output misconfigured - output for port {:?} missing",
+                            &input.port
+                        )
+                    })
+                    .schema_definitions(config.schema_enabled())
+                    .values()
+                    .cloned(),
+            );
+
+            if contains_never(&transform_definitions) {
+                return Err(Error::ContainsNever);
+            }
+
+            definitions.append(&mut transform_definitions);
+        }
+    }
+
+    cache.insert(
+        (config.schema_enabled(), inputs.to_vec()),
+        definitions.clone(),
+    );
+
+    Ok(definitions)
+}
+
+/// Checks if any of the definitions in the list contain `Kind::never()`. This
+/// implies the definition cannot contain any output and thus we should stop
+/// processing further.
+fn contains_never(transform_definitions: &[(OutputId, Definition)]) -> bool {
+    transform_definitions
+        .iter()
+        .any(|(_, definition)| definition.event_kind().is_never())
+}
+
+pub(super) fn validate_sink_expectations(
+    key: &ComponentKey,
+    sink: &SinkOuter<OutputId>,
+    config: &topology::Config,
+    enrichment_tables: &TableRegistry,
+) -> Result<(), Vec<String>> {
+    let mut errors = vec![];
+
+    // Get the schema against which we need to validate the schemas of the components feeding into
+    // this sink.
+    let input = sink.inner.input();
+    let requirement = input.schema_requirement();
+
+    // Get all pipeline definitions feeding into this sink.
+    let mut cache = HashMap::default();
+    let definitions =
+        match expanded_definitions(enrichment_tables, &sink.inputs, config, &mut cache) {
+            Ok(definitions) => definitions,
+            Err(err) => {
+                errors.push(err.to_string());
+                return Err(errors);
+            }
+        };
+
+    // Validate each individual definition against the sink requirement.
+    for (_output, definition) in definitions {
+        if let Err(err) = requirement.validate(&definition, config.schema.validation) {
+            errors.append(
+                &mut err
+                    .errors()
+                    .iter()
+                    .map(|err| format!("schema error in component {key}: {err}"))
+                    .collect(),
+            );
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    Ok(())
+}
+
+pub trait ComponentContainer {
+    fn schema_enabled(&self) -> bool;
+
+    fn source_outputs(&self, key: &ComponentKey) -> Option<Vec<SourceOutput>>;
+
+    fn transform_inputs(&self, key: &ComponentKey) -> Option<&[OutputId]>;
+
+    fn transform_outputs(
+        &self,
+        key: &ComponentKey,
+        enrichment_tables: TableRegistry,
+        input_definitions: &[(OutputId, Definition)],
+    ) -> Option<Vec<TransformOutput>>;
+
+    /// Gets the transform output for the given port.
+    ///
+    /// Returns `Ok(None)` if the transform has no output for the given port.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(())` if no transform has the given key.
+    #[allow(clippy::result_unit_err)]
+    fn transform_output_for_port(
+        &self,
+        key: &ComponentKey,
+        port: &Option<String>,
+        enrichment_tables: TableRegistry,
+        input_definitions: &[(OutputId, Definition)],
+    ) -> Result<Option<TransformOutput>, ()> {
+        if let Some(outputs) = self.transform_outputs(key, enrichment_tables, input_definitions) {
+            Ok(get_output_for_port(outputs, port.as_deref()))
+        } else {
+            Err(())
+        }
+    }
+
+    /// Gets the source output for the given port.
+    ///
+    /// Returns `Ok(None)` if the source has no output for the given port.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(())` if no source has the given key.
+    #[allow(clippy::result_unit_err)]
+    fn source_output_for_port(
+        &self,
+        key: &ComponentKey,
+        port: &Option<String>,
+    ) -> Result<Option<SourceOutput>, ()> {
+        if let Some(outputs) = self.source_outputs(key) {
+            Ok(get_source_output_for_port(outputs, port.as_deref()))
+        } else {
+            Err(())
+        }
+    }
+}
+
+fn get_output_for_port(
+    outputs: Vec<TransformOutput>,
+    port: Option<&str>,
+) -> Option<TransformOutput> {
+    outputs
+        .into_iter()
+        .find(|output| output.port.as_deref() == port)
+}
+
+fn get_source_output_for_port(
+    outputs: Vec<SourceOutput>,
+    port: Option<&str>,
+) -> Option<SourceOutput> {
+    outputs
+        .into_iter()
+        .find(|output| output.port.as_deref() == port)
+}
+
+impl ComponentContainer for Config {
+    fn schema_enabled(&self) -> bool {
+        self.schema.enabled
+    }
+
+    fn source_outputs(&self, key: &ComponentKey) -> Option<Vec<SourceOutput>> {
+        self.source(key)
+            .map(|source| source.inner.outputs(self.schema.log_namespace()))
+    }
+
+    fn transform_inputs(&self, key: &ComponentKey) -> Option<&[OutputId]> {
+        self.transform(key).map(|transform| &transform.inputs[..])
+    }
+
+    fn transform_outputs(
+        &self,
+        key: &ComponentKey,
+        enrichment_tables: TableRegistry,
+        input_definitions: &[(OutputId, Definition)],
+    ) -> Option<Vec<TransformOutput>> {
+        self.transform(key).map(|source| {
+            source.inner.outputs(
+                &TransformContext {
+                    schema: self.schema,
+                    enrichment_tables,
+                    ..Default::default()
+                },
+                input_definitions,
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use async_trait::async_trait;
+    use indexmap::IndexMap;
+    use similar_asserts::assert_eq;
+    use vector_lib::{
+        config::{DataType, Input, SourceOutput, TransformOutput},
+        configurable::configurable_component,
+        enrichment::TableRegistry,
+        lookup::owned_value_path,
+        transform::Transform,
+    };
+    use vrl::value::Kind;
+
+    use super::*;
+    use crate::{
+        config::TransformConfig,
+        test_util::mock::{basic_sink, basic_source, basic_transform, error_definition_transform},
+    };
+
+    /// A passthrough transform that counts output-schema calculations.
+    #[configurable_component(transform("test_schema_counter", "Test schema counter"))]
+    #[derive(Clone, Debug, Default)]
+    struct SchemaCounterConfig {
+        #[serde(skip)]
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl_generate_config_from_default!(SchemaCounterConfig);
+
+    #[async_trait]
+    #[typetag::serde(name = "test_schema_counter")]
+    impl TransformConfig for SchemaCounterConfig {
+        async fn build(&self, context: &TransformContext) -> crate::Result<Transform> {
+            basic_transform("", 0.0).build(context).await
+        }
+
+        fn input(&self) -> Input {
+            Input::all()
+        }
+
+        fn outputs(
+            &self,
+            context: &TransformContext,
+            definitions: &[(OutputId, Definition)],
+        ) -> Vec<TransformOutput> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut outputs = basic_transform("", 0.0).outputs(context, definitions);
+            outputs.push(
+                TransformOutput::new(
+                    DataType::all_bits(),
+                    definitions
+                        .iter()
+                        .map(|(id, definition)| {
+                            (
+                                id.clone(),
+                                definition.clone().with_event_field(
+                                    &owned_value_path!("alternate"),
+                                    Kind::boolean(),
+                                    None,
+                                ),
+                            )
+                        })
+                        .collect(),
+                )
+                .with_port("alternate"),
+            );
+            outputs
+        }
+    }
+
+    type DefinitionWalker = fn(
+        &[OutputId],
+        &Config,
+        &TableRegistry,
+        &mut Cache,
+    ) -> Result<Vec<(OutputId, Definition)>, Error>;
+
+    const DEFINITION_WALKERS: [DefinitionWalker; 2] = [
+        |inputs, config, tables, cache| possible_definitions(inputs, config, tables, cache),
+        input_definitions,
+    ];
+
+    fn diamond_config(schema_enabled: bool) -> (Config, Arc<AtomicUsize>) {
+        let mut builder = Config::builder();
+        builder.schema.enabled = schema_enabled;
+        let counter = SchemaCounterConfig::default();
+        let calls = Arc::clone(&counter.calls);
+        builder.add_source("source", basic_source().1);
+        builder.add_transform("shared", &["source"], counter);
+        builder.add_transform("left", &["shared"], basic_transform("", 0.0));
+        builder.add_transform("right", &["shared"], basic_transform("", 0.0));
+        builder.add_sink(
+            "sink",
+            &["left", "right", "shared.alternate"],
+            basic_sink(1).1,
+        );
+        let config = builder.build().unwrap();
+        // Config compilation also discovers output ports; count only the schema walk.
+        calls.store(0, Ordering::Relaxed);
+        (config, calls)
+    }
+
+    #[test]
+    fn schema_walk_reuses_shared_upstream_definitions() {
+        for walk in DEFINITION_WALKERS {
+            for schema_enabled in [false, true] {
+                let (config, calls) = diamond_config(schema_enabled);
+                let inputs = vec!["left".into(), "right".into()];
+                let mut cache = HashMap::new();
+                let tables = TableRegistry::default();
+
+                let definitions = walk(&inputs, &config, &tables, &mut cache).unwrap();
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+                assert_eq!(
+                    definitions,
+                    vec![
+                        ("left".into(), Definition::default_legacy_namespace()),
+                        ("right".into(), Definition::default_legacy_namespace()),
+                    ]
+                );
+
+                let repeated = walk(&inputs, &config, &tables, &mut cache).unwrap();
+                assert_eq!(repeated, definitions);
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn schema_cache_preserves_ports_input_order_and_schema_mode() {
+        for walk in DEFINITION_WALKERS {
+            let (mut config, calls) = diamond_config(true);
+            let mut cache = HashMap::new();
+            let tables = TableRegistry::default();
+            let default = OutputId::from("shared");
+            let alternate = OutputId {
+                component: "shared".into(),
+                port: Some("alternate".into()),
+            };
+
+            let defaults =
+                walk(std::slice::from_ref(&default), &config, &tables, &mut cache).unwrap();
+            let alternates = walk(
+                std::slice::from_ref(&alternate),
+                &config,
+                &tables,
+                &mut cache,
+            )
+            .unwrap();
+            assert_ne!(defaults[0].1, alternates[0].1);
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+            let ordered = walk(
+                &[alternate.clone(), default, alternate],
+                &config,
+                &tables,
+                &mut cache,
+            )
+            .unwrap();
+            assert_eq!(
+                ordered,
+                [alternates.clone(), defaults, alternates.clone()].concat()
+            );
+
+            config.schema.enabled = false;
+            let disabled = walk(&[alternates[0].0.clone()], &config, &tables, &mut cache).unwrap();
+            assert_ne!(disabled[0].1, alternates[0].1);
+        }
+    }
+
+    #[test]
+    fn schema_cache_does_not_hide_invalid_upstream_definitions() {
+        for walk in DEFINITION_WALKERS {
+            let mut builder = Config::builder();
+            builder.schema.enabled = true;
+            builder.add_source("source", basic_source().1);
+            builder.add_transform("invalid", &["source"], error_definition_transform());
+            builder.add_sink("sink", &["invalid"], basic_sink(1).1);
+            let config = builder.build().unwrap();
+            let mut cache = HashMap::new();
+            let inputs = vec!["invalid".into()];
+
+            for _ in 0..2 {
+                assert!(matches!(
+                    walk(&inputs, &config, &TableRegistry::default(), &mut cache),
+                    Err(Error::ContainsNever)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting these schema expansion cases is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
+    fn test_expanded_definition() {
+        struct TestCase {
+            inputs: Vec<(&'static str, Option<String>)>,
+            sources: IndexMap<&'static str, Vec<SourceOutput>>,
+            transforms: IndexMap<&'static str, (Vec<OutputId>, Vec<TransformOutput>)>,
+            want: Vec<(OutputId, Definition)>,
+        }
+
+        impl ComponentContainer for TestCase {
+            fn schema_enabled(&self) -> bool {
+                true
+            }
+
+            fn source_outputs(&self, key: &ComponentKey) -> Option<Vec<SourceOutput>> {
+                self.sources.get(key.id()).cloned()
+            }
+
+            fn transform_inputs(&self, key: &ComponentKey) -> Option<&[OutputId]> {
+                self.transforms.get(key.id()).map(|v| v.0.as_slice())
+            }
+
+            fn transform_outputs(
+                &self,
+                key: &ComponentKey,
+                _: TableRegistry,
+                _: &[(OutputId, Definition)],
+            ) -> Option<Vec<TransformOutput>> {
+                self.transforms.get(key.id()).cloned().map(|v| v.1)
+            }
+        }
+
+        for (title, case) in HashMap::from([
+            (
+                "no inputs",
+                TestCase {
+                    inputs: vec![],
+                    sources: IndexMap::default(),
+                    transforms: IndexMap::default(),
+                    want: vec![],
+                },
+            ),
+            (
+                "single input, source with default schema",
+                TestCase {
+                    inputs: vec![("foo", None)],
+                    sources: IndexMap::from([(
+                        "foo",
+                        vec![SourceOutput::new_maybe_logs(
+                            DataType::all_bits(),
+                            Definition::default_legacy_namespace(),
+                        )],
+                    )]),
+                    transforms: IndexMap::default(),
+                    want: vec![("foo".into(), Definition::default_legacy_namespace())],
+                },
+            ),
+            (
+                "single input, source with schema",
+                TestCase {
+                    inputs: vec![("source-foo", None)],
+                    sources: IndexMap::from([(
+                        "source-foo",
+                        vec![SourceOutput::new_maybe_logs(
+                            DataType::all_bits(),
+                            Definition::empty_legacy_namespace().with_event_field(
+                                &owned_value_path!("foo"),
+                                Kind::integer().or_bytes(),
+                                Some("foo bar"),
+                            ),
+                        )],
+                    )]),
+                    transforms: IndexMap::default(),
+                    want: vec![(
+                        "source-foo".into(),
+                        Definition::empty_legacy_namespace().with_event_field(
+                            &owned_value_path!("foo"),
+                            Kind::integer().or_bytes(),
+                            Some("foo bar"),
+                        ),
+                    )],
+                },
+            ),
+            (
+                "multiple inputs, sources with schema",
+                TestCase {
+                    inputs: vec![("source-foo", None), ("source-bar", None)],
+                    sources: IndexMap::from([
+                        (
+                            "source-foo",
+                            vec![SourceOutput::new_maybe_logs(
+                                DataType::all_bits(),
+                                Definition::empty_legacy_namespace().with_event_field(
+                                    &owned_value_path!("foo"),
+                                    Kind::integer().or_bytes(),
+                                    Some("foo bar"),
+                                ),
+                            )],
+                        ),
+                        (
+                            "source-bar",
+                            vec![SourceOutput::new_maybe_logs(
+                                DataType::all_bits(),
+                                Definition::empty_legacy_namespace().with_event_field(
+                                    &owned_value_path!("foo"),
+                                    Kind::timestamp(),
+                                    Some("baz qux"),
+                                ),
+                            )],
+                        ),
+                    ]),
+                    transforms: IndexMap::default(),
+                    want: vec![
+                        (
+                            "source-foo".into(),
+                            Definition::empty_legacy_namespace().with_event_field(
+                                &owned_value_path!("foo"),
+                                Kind::integer().or_bytes(),
+                                Some("foo bar"),
+                            ),
+                        ),
+                        (
+                            "source-bar".into(),
+                            Definition::empty_legacy_namespace().with_event_field(
+                                &owned_value_path!("foo"),
+                                Kind::timestamp(),
+                                Some("baz qux"),
+                            ),
+                        ),
+                    ],
+                },
+            ),
+            (
+                "transform overrides source",
+                TestCase {
+                    inputs: vec![("source-bar", None), ("transform-baz", None)],
+                    sources: IndexMap::from([
+                        (
+                            "source-foo",
+                            vec![SourceOutput::new_maybe_logs(
+                                DataType::all_bits(),
+                                Definition::empty_legacy_namespace().with_event_field(
+                                    &owned_value_path!("foo"),
+                                    Kind::boolean(),
+                                    Some("foo"),
+                                ),
+                            )],
+                        ),
+                        (
+                            "source-bar",
+                            vec![SourceOutput::new_maybe_logs(
+                                DataType::all_bits(),
+                                Definition::empty_legacy_namespace().with_event_field(
+                                    &owned_value_path!("bar"),
+                                    Kind::integer(),
+                                    Some("bar"),
+                                ),
+                            )],
+                        ),
+                    ]),
+                    transforms: IndexMap::from([(
+                        "transform-baz",
+                        (
+                            vec![OutputId::from("source-foo")],
+                            vec![TransformOutput::new(
+                                DataType::all_bits(),
+                                [(
+                                    "source-foo".into(),
+                                    Definition::empty_legacy_namespace().with_event_field(
+                                        &owned_value_path!("baz"),
+                                        Kind::regex(),
+                                        Some("baz"),
+                                    ),
+                                )]
+                                .into(),
+                            )],
+                        ),
+                    )]),
+                    want: vec![
+                        (
+                            "source-bar".into(),
+                            Definition::empty_legacy_namespace().with_event_field(
+                                &owned_value_path!("bar"),
+                                Kind::integer(),
+                                Some("bar"),
+                            ),
+                        ),
+                        (
+                            "transform-baz".into(),
+                            Definition::empty_legacy_namespace().with_event_field(
+                                &owned_value_path!("baz"),
+                                Kind::regex(),
+                                Some("baz"),
+                            ),
+                        ),
+                    ],
+                },
+            ),
+            //   Source 1 -> Transform 1                ->
+            //   Source 2 -> Transform 2                ->
+            //            -> Transform 3 ->
+            //            -> Transform 4 -> Transform 5 -> Sink 1
+            (
+                "complex topology",
+                TestCase {
+                    inputs: vec![
+                        ("Transform 1", None),
+                        ("Transform 2", None),
+                        ("Transform 5", None),
+                    ],
+                    sources: IndexMap::from([
+                        (
+                            "Source 1",
+                            vec![SourceOutput::new_maybe_logs(
+                                DataType::all_bits(),
+                                Definition::empty_legacy_namespace().with_event_field(
+                                    &owned_value_path!("source-1"),
+                                    Kind::boolean(),
+                                    Some("source-1"),
+                                ),
+                            )],
+                        ),
+                        (
+                            "Source 2",
+                            vec![SourceOutput::new_maybe_logs(
+                                DataType::all_bits(),
+                                Definition::empty_legacy_namespace().with_event_field(
+                                    &owned_value_path!("source-2"),
+                                    Kind::integer(),
+                                    Some("source-2"),
+                                ),
+                            )],
+                        ),
+                    ]),
+                    transforms: IndexMap::from([
+                        (
+                            "Transform 1",
+                            (
+                                vec![OutputId::from("Source 1")],
+                                vec![TransformOutput::new(
+                                    DataType::all_bits(),
+                                    [(
+                                        "Source 1".into(),
+                                        Definition::empty_legacy_namespace().with_event_field(
+                                            &owned_value_path!("transform-1"),
+                                            Kind::regex(),
+                                            None,
+                                        ),
+                                    )]
+                                    .into(),
+                                )],
+                            ),
+                        ),
+                        (
+                            "Transform 2",
+                            (
+                                vec![OutputId::from("Source 2")],
+                                vec![TransformOutput::new(
+                                    DataType::all_bits(),
+                                    [(
+                                        "Source 2".into(),
+                                        Definition::empty_legacy_namespace().with_event_field(
+                                            &owned_value_path!("transform-2"),
+                                            Kind::float().or_null(),
+                                            Some("transform-2"),
+                                        ),
+                                    )]
+                                    .into(),
+                                )],
+                            ),
+                        ),
+                        (
+                            "Transform 3",
+                            (
+                                vec![OutputId::from("Source 2")],
+                                vec![TransformOutput::new(
+                                    DataType::all_bits(),
+                                    [(
+                                        "Source 2".into(),
+                                        Definition::empty_legacy_namespace().with_event_field(
+                                            &owned_value_path!("transform-3"),
+                                            Kind::integer(),
+                                            Some("transform-3"),
+                                        ),
+                                    )]
+                                    .into(),
+                                )],
+                            ),
+                        ),
+                        (
+                            "Transform 4",
+                            (
+                                vec![OutputId::from("Source 2")],
+                                vec![TransformOutput::new(
+                                    DataType::all_bits(),
+                                    [(
+                                        "Source 2".into(),
+                                        Definition::empty_legacy_namespace().with_event_field(
+                                            &owned_value_path!("transform-4"),
+                                            Kind::timestamp().or_bytes(),
+                                            Some("transform-4"),
+                                        ),
+                                    )]
+                                    .into(),
+                                )],
+                            ),
+                        ),
+                        (
+                            "Transform 5",
+                            (
+                                vec![OutputId::from("Transform 3"), OutputId::from("Transform 4")],
+                                vec![TransformOutput::new(
+                                    DataType::all_bits(),
+                                    [(
+                                        "Transform 3".into(),
+                                        Definition::empty_legacy_namespace().with_event_field(
+                                            &owned_value_path!("transform-5"),
+                                            Kind::boolean(),
+                                            Some("transform-5"),
+                                        ),
+                                    )]
+                                    .into(),
+                                )],
+                            ),
+                        ),
+                    ]),
+                    want: vec![
+                        // Pipeline 1
+                        (
+                            "Transform 1".into(),
+                            Definition::empty_legacy_namespace().with_event_field(
+                                &owned_value_path!("transform-1"),
+                                Kind::regex(),
+                                None,
+                            ),
+                        ),
+                        // Pipeline 2
+                        (
+                            "Transform 2".into(),
+                            Definition::empty_legacy_namespace().with_event_field(
+                                &owned_value_path!("transform-2"),
+                                Kind::float().or_null(),
+                                Some("transform-2"),
+                            ),
+                        ),
+                        // Pipeline 3
+                        (
+                            "Transform 5".into(),
+                            Definition::empty_legacy_namespace().with_event_field(
+                                &owned_value_path!("transform-5"),
+                                Kind::boolean(),
+                                Some("transform-5"),
+                            ),
+                        ),
+                    ],
+                },
+            ),
+        ]) {
+            let inputs = case
+                .inputs
+                .iter()
+                .cloned()
+                .map(|(key, port)| OutputId {
+                    component: key.into(),
+                    port,
+                })
+                .collect::<Vec<_>>();
+
+            let got = expanded_definitions(
+                &TableRegistry::default(),
+                &inputs,
+                &case,
+                &mut HashMap::default(),
+            )
+            .unwrap();
+            assert_eq!(got, case.want, "{title}");
+        }
+    }
+}
